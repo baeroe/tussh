@@ -4,8 +4,10 @@ package audit
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/baeroe/tussh/internal/config"
@@ -20,7 +22,8 @@ const (
 	Blocked  = "blocked" // policy deny (level none, unknown connection, invalid input)
 )
 
-// Entry is one audit record. Command output is not logged.
+// Entry is one audit record. Command output is kept bounded (OutputCap bytes per stream, head and tail)
+// unless disable_audit_output is set.
 type Entry struct {
 	Time          time.Time `json:"time"`
 	Connection    string    `json:"connection"`
@@ -36,6 +39,23 @@ type Entry struct {
 	TimedOut      bool      `json:"timed_out,omitempty"`
 	Error         string    `json:"error,omitempty"`
 	DurationMS    int64     `json:"duration_ms,omitempty"`
+	Note          string    `json:"note,omitempty"` // the user's note on a denial
+	Stdout        string    `json:"stdout,omitempty"`
+	Stderr        string    `json:"stderr,omitempty"`
+	OutputClipped bool      `json:"output_clipped,omitempty"`
+}
+
+// OutputCap is the number of bytes of stdout and of stderr kept per entry.
+const OutputCap = 4096
+
+// Clip bounds s to OutputCap bytes (first and last half kept) and reports whether it cut something.
+func Clip(s string) (string, bool) {
+	if len(s) <= OutputCap {
+		return s, false
+	}
+	half := OutputCap / 2
+	head, tail := strings.ToValidUTF8(s[:half], ""), strings.ToValidUTF8(s[len(s)-half:], "")
+	return fmt.Sprintf("%s\n[... %d bytes not logged ...]\n%s", head, len(s)-2*half, tail), true
 }
 
 // File is the audit log path.
@@ -89,4 +109,13 @@ func Read(limit int) ([]Entry, error) {
 		}
 	}
 	return out, sc.Err()
+}
+
+// LastActivity is the time of the newest audit entry (the log's mtime), zero if there is none.
+func LastActivity() time.Time {
+	info, err := os.Stat(File())
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
 }

@@ -12,25 +12,28 @@ import (
 	"github.com/baeroe/tussh/internal/secrets"
 )
 
-// Form field ids.
+// Form field ids, in display order.
 const (
 	fName = iota
-	fGroup
-	fDescription
 	fHost
 	fPort
 	fUser
+	fDescription
+	fTags
 	fAuth
-	fPassword
 	fKeyPath
 	fPassphrase
+	fPassword
 	fLevel
 	fTunnels
 	numFields
 )
 
-var fieldLabels = [numFields]string{"Name", "Group", "Description", "Host", "Port", "User", "Auth", "Password",
-	"Key file", "Key passphrase", "Agent access", "Tunnels"}
+var fieldLabels = [numFields]string{"Name", "Host", "Port", "User", "Description", "Tags", "Method", "Key file",
+	"Key passphrase", "Password", "Level", "Forwards"}
+
+// formSections start at these fields.
+var formSections = map[int]string{fName: "Connection", fAuth: "Authentication", fLevel: "Agent access", fTunnels: "Tunnels"}
 
 type connForm struct {
 	orig   *config.Connection
@@ -39,6 +42,11 @@ type connForm struct {
 	level  string
 	focus  int
 	err    string
+
+	testing    bool
+	testGen    int
+	testResult string
+	testOK     bool
 }
 
 func newForm(c *config.Connection) *connForm {
@@ -47,9 +55,16 @@ func newForm(c *config.Connection) *connForm {
 		ti := textinput.New()
 		ti.Prompt = ""
 		ti.CharLimit = 512
+		ti.Width = 40 // set again when rendering; without a width the placeholder shows only one character
 		f.inputs[i] = ti
 	}
+	f.inputs[fName].Placeholder = "web-prod"
+	f.inputs[fHost].Placeholder = "host name or IP"
 	f.inputs[fPort].Placeholder = "22"
+	f.inputs[fPort].CharLimit = 5
+	f.inputs[fUser].Placeholder = "remote user (empty: ssh default)"
+	f.inputs[fDescription].Placeholder = "optional, also shown to agents"
+	f.inputs[fTags].Placeholder = "comma-separated, e.g. prod, shop"
 	f.inputs[fKeyPath].Placeholder = "~/.ssh/id_ed25519 (empty: ssh defaults / agent)"
 	f.inputs[fTunnels].Placeholder = "mysql=3307:127.0.0.1:3306, redis=6380:localhost:6379"
 	f.inputs[fPassword].EchoMode = textinput.EchoPassword
@@ -60,8 +75,8 @@ func newForm(c *config.Connection) *connForm {
 		cc := *c
 		f.orig = &cc
 		f.inputs[fName].SetValue(c.Name)
-		f.inputs[fGroup].SetValue(c.Group)
 		f.inputs[fDescription].SetValue(c.Description)
+		f.inputs[fTags].SetValue(strings.Join(c.Tags, ", "))
 		f.inputs[fHost].SetValue(c.Host)
 		if c.Port != 0 {
 			f.inputs[fPort].SetValue(strconv.Itoa(c.Port))
@@ -187,8 +202,9 @@ func (m *Model) formKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flash("cancelled")
 		return m, nil
 	case "ctrl+s":
-		m.saveForm()
-		return m, nil
+		return m, m.saveFormCmd()
+	case "ctrl+t":
+		return m, m.testForm()
 	case "tab", "down":
 		f.move(1)
 		return m, nil
@@ -197,8 +213,7 @@ func (m *Model) formKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		if f.focus == fTunnels {
-			m.saveForm()
-			return m, nil
+			return m, m.saveFormCmd()
 		}
 		f.move(1)
 		return m, nil
@@ -217,21 +232,19 @@ func (m *Model) formKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// saveForm validates, stores secrets in the keyring and writes connections.json.
-func (m *Model) saveForm() {
-	f := m.form
+// build turns the form into a connection (not saved) plus the secrets typed in it.
+func (f *connForm) build() (c config.Connection, password, passphrase string, err error) {
 	val := func(i int) string { return strings.TrimSpace(f.inputs[i].Value()) }
-	c := config.Connection{}
 	if f.orig != nil {
 		c = *f.orig
 	}
-	c.Name, c.Group, c.Description, c.Host, c.User = val(fName), val(fGroup), val(fDescription), val(fHost), val(fUser)
+	c.Name, c.Description, c.Host, c.User = val(fName), val(fDescription), val(fHost), val(fUser)
+	c.Tags = config.ParseTags(val(fTags))
 	c.Port = 0
 	if p := val(fPort); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			f.err = "port: must be a number"
-			return
+		n, perr := strconv.Atoi(p)
+		if perr != nil {
+			return c, "", "", fmt.Errorf("port: must be a number")
 		}
 		c.Port = n
 	}
@@ -240,23 +253,66 @@ func (m *Model) saveForm() {
 	if c.Auth == config.AuthKey {
 		c.KeyPath = val(fKeyPath)
 	}
-	ts, err := parseTunnels(val(fTunnels))
-	if err != nil {
-		f.err = err.Error()
-		return
+	ts, terr := parseTunnels(val(fTunnels))
+	if terr != nil {
+		return c, "", "", terr
 	}
 	c.Tunnels = ts
 	if c.ID == "" {
 		c.ID = config.NewID()
 	}
-	password := f.inputs[fPassword].Value()
-	passphrase := f.inputs[fPassphrase].Value()
-	if c.Auth == config.AuthPassword && password == "" && !c.HasPassword {
-		f.err = "password: required for password auth (it is stored in the keychain)"
-		return
+	if c.Auth == config.AuthPassword {
+		password = f.inputs[fPassword].Value()
+	} else {
+		passphrase = f.inputs[fPassphrase].Value()
 	}
 	if err := c.Validate(); err != nil {
+		return c, "", "", err
+	}
+	return c, password, passphrase, nil
+}
+
+// testForm runs a real, non-interactive login with the form's values (only when the user asks).
+func (m *Model) testForm() tea.Cmd {
+	f := m.form
+	c, password, passphrase, err := f.build()
+	if err != nil {
+		f.testResult, f.testOK, f.testing = err.Error(), false, false
+		return nil
+	}
+	if f.orig == nil {
+		c.HasPassword, c.HasPassphrase = false, false
+	}
+	if c.Auth == config.AuthPassword && password == "" && !c.HasPassword {
+		f.testResult, f.testOK = "enter the password first", false
+		return nil
+	}
+	f.testGen++
+	f.testing, f.testResult, f.err = true, "", ""
+	gen, test := f.testGen, m.opts.TestConn
+	secret := password + passphrase
+	return func() tea.Msg { return testConnMsg{gen: gen, err: test(c, secret)} }
+}
+
+// saveFormCmd saves and, once the form is closed, probes the (possibly new) host.
+func (m *Model) saveFormCmd() tea.Cmd {
+	m.saveForm()
+	if m.form == nil && !m.opts.NoTick {
+		return m.checkReach(false)
+	}
+	return nil
+}
+
+// saveForm validates, stores secrets in the keyring and writes connections.json.
+func (m *Model) saveForm() {
+	f := m.form
+	c, password, passphrase, err := f.build()
+	if err != nil {
 		f.err = err.Error()
+		return
+	}
+	if c.Auth == config.AuthPassword && password == "" && !c.HasPassword {
+		f.err = "password: required for password auth (it is stored in the keychain)"
 		return
 	}
 	for _, o := range m.store.Connections {
@@ -299,4 +355,98 @@ func (m *Model) saveForm() {
 	m.refreshTunnels()
 	m.selectByID(c.ID)
 	m.flash("saved %s (agent access %s)", c.Name, c.AccessLevel)
+}
+
+// --- rendering ----------------------------------------------------------------------------
+
+func choice(opts []string, cur string, focused bool) string {
+	var parts []string
+	for _, o := range opts {
+		switch {
+		case o == cur && focused:
+			parts = append(parts, selStyle.Render("● "+o))
+		case o == cur:
+			parts = append(parts, boldStyle.Render("● "+o))
+		default:
+			parts = append(parts, dimStyle.Render("○ "+o))
+		}
+	}
+	return strings.Join(parts, "  ")
+}
+
+// formBox renders the form as a modal of at most w x h cells; it scrolls to keep the focused field visible.
+func (m *Model) formBox(w, h int) string {
+	f := m.form
+	fw := min(w-2, 80)
+	iw := fw - 4
+	const lw = 16
+	inW := max(iw-2-lw-1, 10)
+	var lines []string
+	focusLine := 0
+	for i := 0; i < numFields; i++ {
+		if !f.visible(i) {
+			continue
+		}
+		if sec, ok := formSections[i]; ok {
+			if i != fName {
+				lines = append(lines, "")
+			}
+			lines = append(lines, accentStyle.Bold(true).Render(sec))
+		}
+		label := fit(fieldLabels[i], lw)
+		mark := "  "
+		if i == f.focus {
+			label = selStyle.Render(label)
+			mark = selStyle.Render("› ")
+			focusLine = len(lines)
+		} else {
+			label = labelStyle.Render(label)
+		}
+		var v string
+		switch i {
+		case fAuth:
+			v = choice([]string{config.AuthKey, config.AuthPassword}, f.auth, i == f.focus)
+		case fLevel:
+			v = choice(config.Levels, f.level, i == f.focus)
+		default:
+			f.inputs[i].Width = inW - 1
+			v = f.inputs[i].View()
+		}
+		lines = append(lines, mark+label+v)
+		switch i {
+		case fLevel:
+			lines = append(lines, strings.Repeat(" ", lw+2)+badge(f.level, true))
+			for _, s := range wrap(levelExplain(f.level), inW) {
+				lines = append(lines, strings.Repeat(" ", lw+2)+dimStyle.Render(s))
+			}
+		case fTunnels:
+			lines = append(lines, strings.Repeat(" ", lw+2)+dimStyle.Render("name=[bind:]local:host:port, comma-separated"))
+		}
+	}
+	var foot []string
+	foot = append(foot, "")
+	switch {
+	case f.err != "":
+		foot = append(foot, badStyle.Render("✗ "+f.err))
+	case f.testing:
+		foot = append(foot, warnStyle.Render("◌ testing the connection …"))
+	case f.testResult != "" && f.testOK:
+		foot = append(foot, goodStyle.Render("✓ "+f.testResult))
+	case f.testResult != "":
+		foot = append(foot, badStyle.Render("✗ test failed: "+f.testResult))
+	default:
+		foot = append(foot, dimStyle.Render("Secrets go to the keychain; empty secret fields keep the stored value."))
+	}
+	foot = append(foot, keyHints("ctrl+s", "save", "ctrl+t", "test connection", "esc", "cancel"))
+	room := h - 2 - len(foot)
+	if len(lines) > room && room > 3 {
+		start := max(0, focusLine-room/2)
+		start = min(start, len(lines)-room)
+		lines = lines[start : start+room]
+	}
+	title := "New connection"
+	if f.orig != nil {
+		title = "Edit " + f.orig.Name
+	}
+	return modalBox(title, append(lines, foot...), fw, cAccent)
 }

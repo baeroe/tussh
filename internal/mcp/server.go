@@ -183,7 +183,7 @@ func tools() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "list_connections",
-			"description": "List the SSH connections the user shared with agents: name, group, description and access level (read-only, approve-each, trusted). Contains no hosts or secrets.",
+			"description": "List the SSH connections the user shared with agents: name, description, tags and access level (read-only, approve-each, trusted). Contains no hosts or secrets.",
 			"inputSchema": schema(map[string]any{}),
 		},
 		{

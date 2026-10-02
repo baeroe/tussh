@@ -12,7 +12,7 @@ tussh succeeds the herdr-ssh prototype (a Python herdr plugin). It keeps that pl
 | Tunnels | Tunnels tab | none |
 | Approvals | Alerts tab and popup, `tussh approve/deny` | blocking `run_command` |
 
-The TUI and any number of MCP processes share state only through files in the state dir: `approvals/`, `audit.jsonl`, `tunnels/`, `askpass/` and `tui/` (heartbeats that tell an MCP process whether a TUI is open).
+The TUI and any number of MCP processes share state only through files in the state dir: `approvals/`, `allow/` (remembered commands), `audit.jsonl`, `tunnels/`, `askpass/`, `used/` (last use per connection) and `tui/` (heartbeats that tell an MCP process whether a TUI is open). Only the TUI writes `connections.json`.
 
 ## Decisions
 
@@ -23,21 +23,37 @@ The TUI and any number of MCP processes share state only through files in the st
 - **Askpass with one-time tokens**, so `tussh askpass` is not a general-purpose "print my password" command. It is not a security boundary against a same-user process, which could read the keychain directly. See the README.
 - **Minimal MCP implementation** (about 250 lines) instead of an SDK. tussh only needs initialize, ping, tools/list, tools/call and cancellation, and it has no extra dependencies.
 - **`~/.config` on macOS too**, because this is a terminal tool and the files should be easy to find.
+- **A flat connection list, no groups or environments.** Favorites on top, then most recently used. Tags are free text for search; prod/staging go into the name or a tag. Old `group` values are migrated to tags.
+- **Remembered approvals are exact.** "Approve & remember" allows one exact command string on one connection until an expiry (default 8 h). No patterns or prefixes: anything that differs asks again. The entries are files in the state dir, so the separate MCP processes check them before creating a request.
+- **Last use lives in the state dir**, not in `connections.json`, so MCP processes never write the connection file and cannot race with the TUI.
+- **Reachability is a plain TCP connect** to host:port (no ssh, no login), in the background every 45 s and on `r`.
+- **ANSI palette colors only**, so the TUI follows the terminal theme. Icons are limited to characters whose width all width tables agree on (default-emoji-presentation emoji are 2 cells, symbols 1), so columns stay aligned in Ghostty, herdr and elsewhere: 👀 stands for read-only and ⌛ for timeout instead of 👁/⏱, whose width depends on the terminal.
 
 ## Out of scope for now
 
 - Agents starting tunnels, or an interactive session for agents (`open_pane`)
 - `request_status` / asynchronous approvals. Today `run_command` blocks until it is decided or times out, so a harness with a shorter tool timeout than the approval timeout gives up first.
-- Approve-and-remember ("always allow this command on this connection"), and approving an edited command
+- Approving an edited command, and remembering command patterns or prefixes (remembering is exact-match only)
 - Switching off built-in rules, per-connection rule sets, and safe-pipe allowlisting for read-only (`| grep`, `| head`)
 - Jump hosts and ProxyJump per connection (tussh can use the ssh config through `TUSSH_SSH_CONFIG`, but the form has no field for it)
 - Editing ssh options per connection, `known_hosts` management in the TUI, and SFTP/scp helpers for agents
-- A tamper-evident (hash-chained) audit log, log rotation, and including output in the log
+- A tamper-evident (hash-chained) audit log and log rotation (output is now logged, bounded to 4 kB per stream)
 - Tunnel supervision (restart on drop, restore after reboot)
 - Windows support
+
+## Done
+
+- TUI redesign: two panes (list and details) with a single-column layout below 90 columns, header with status chips, a help overlay, ANSI palette colors, the connection form as a sectioned dialog with a connection test (Ctrl+T)
+- Favorites, last-used ordering, tags (with migration of the old `group` field), fuzzy search
+- Background reachability check
+- Alerts as cards with a countdown, deny with a note for the agent, approve & remember with revocation in the detail pane
+- History as a filterable table with a detail pane and bounded output in the audit log (the connection's own secret is redacted; can be switched off)
+- Setup shows paths with `~` and detects existing registrations by reading the harness configs
 
 ## Open questions
 
 - Should `trusted` also send read-only commands in the re-quoted (no-glob) form? Today it sends them as-is.
 - Should `docker compose down` without `-v` stay sensitive? It removes containers but not data.
-- Should a denied request let you attach a note for the agent? The queue already supports `Note`, but the TUI has no input for it.
+- Should "approve & remember" also offer "until the end of the day" next to the fixed TTL?
+- Reachability dials the `host` field. Connections that only work through an ssh config alias or a jump host show as unreachable; should the check use `ssh -G` to resolve them, or be switchable per connection?
+- Registration detection only reads user-level configs. Project-level registrations (`.mcp.json`, project settings) are not shown.

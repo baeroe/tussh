@@ -5,6 +5,7 @@ package sshrun
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/baeroe/tussh/internal/config"
+	"github.com/baeroe/tussh/internal/secrets"
 )
 
 // Limits for agent runs.
@@ -116,6 +118,10 @@ func tokenDir() string { return filepath.Join(config.StateDir(), "askpass") }
 type tokenFile struct {
 	ConnID  string    `json:"conn_id"`
 	Expires time.Time `json:"expires"`
+	// Account and Kind name a temporary keyring entry (connection test from the form, before saving):
+	// askpass then answers with that secret instead of the stored connection's one.
+	Account string `json:"account,omitempty"`
+	Kind    string `json:"kind,omitempty"`
 }
 
 // AskpassEnv holds the environment for one ssh process and removes its token on Close.
@@ -136,9 +142,16 @@ func NewAskpass(c config.Connection, interactive bool, ttl time.Duration) (*Askp
 	if !needsAskpass(c) {
 		return nil, nil
 	}
+	return newAskpassToken(tokenFile{ConnID: c.ID, Expires: time.Now().Add(ttl)}, interactive)
+}
+
+func newAskpassToken(tf tokenFile, interactive bool) (*AskpassEnv, error) {
 	tok := config.NewID() + config.NewID()
-	data := fmt.Sprintf(`{"conn_id":%q,"expires":%q}`, c.ID, time.Now().Add(ttl).Format(time.RFC3339Nano))
-	if err := config.WriteFileAtomic(filepath.Join(tokenDir(), tok), []byte(data), 0o600); err != nil {
+	data, err := json.Marshal(tf)
+	if err != nil {
+		return nil, err
+	}
+	if err := config.WriteFileAtomic(filepath.Join(tokenDir(), tok), data, 0o600); err != nil {
 		return nil, err
 	}
 	env := []string{"SSH_ASKPASS=" + Self(), "SSH_ASKPASS_REQUIRE=force", "TUSSH_ASKPASS_MODE=1", "TUSSH_ASKPASS_TOKEN=" + tok}
@@ -289,4 +302,62 @@ func CommandLine(c config.Connection, mode Mode) string {
 		parts = append(parts, a)
 	}
 	return strings.Join(parts, " ")
+}
+
+// TestConnection logs in non-interactively and runs `true` (BatchMode, short timeout, no new host keys).
+// secret, if not empty, is a password or key passphrase typed in the form but not saved yet; it is put into
+// the keyring under a temporary account for the duration of the test. Otherwise stored secrets are used.
+func TestConnection(ctx context.Context, c config.Connection, kr secrets.Keyring, secret string, timeout time.Duration) error {
+	var ap *AskpassEnv
+	var err error
+	if secret != "" {
+		kind := secrets.KindPassphrase
+		if c.Auth == config.AuthPassword {
+			kind = secrets.KindPassword
+			c.HasPassword = true
+		} else {
+			c.HasPassphrase = true
+		}
+		account := secrets.Account("test-"+config.NewID(), kind)
+		if err := kr.Set(account, secret); err != nil {
+			return fmt.Errorf("keychain: %w", err)
+		}
+		defer func() { _ = kr.Delete(account) }()
+		ap, err = newAskpassToken(tokenFile{ConnID: c.ID, Expires: time.Now().Add(timeout + time.Minute), Account: account, Kind: kind}, false)
+	} else {
+		ap, err = NewAskpass(c, false, timeout+time.Minute)
+	}
+	if err != nil {
+		return err
+	}
+	defer ap.Close()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	argv := append(Args(c, ModeAgent), "true")
+	argv = append([]string{"-o", "ConnectTimeout=5"}, argv...)
+	cmd := exec.CommandContext(ctx, SSHBin(), argv...)
+	cmd.Env = os.Environ()
+	if ap != nil {
+		cmd.Env = append(cmd.Env, ap.Env...)
+	}
+	cmd.Stdin = nil
+	var errb capBuf
+	errb.limit = 4000
+	cmd.Stderr = &errb
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.WaitDelay = time.Second
+	err = cmd.Run()
+	if ctx.Err() != nil {
+		return fmt.Errorf("no answer within %s", timeout)
+	}
+	if err != nil {
+		msg, _ := errb.String()
+		lines := strings.Split(strings.TrimSpace(msg), "\n")
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if last == "" {
+			last = err.Error()
+		}
+		return errors.New(last)
+	}
+	return nil
 }

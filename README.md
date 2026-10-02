@@ -82,45 +82,61 @@ If the file is invalid (broken JSON, an unknown field or a bad regex), **every**
 
 1. An agent calls `run_command`. tussh classifies the command and applies the access level.
 2. If the command needs approval, tussh writes a request to `~/.local/state/tussh/approvals/` (files with mode 0600 and atomic writes), and the MCP call **blocks**.
-3. The TUI's **Alerts** tab lists the pending requests with the connection, the command, why approval is needed, the requesting agent (MCP `clientInfo`) and the agent's optional justification. When a new request arrives while the TUI is open, a **popup** appears. Keys: **a** approve, **d** deny, **Esc** later.
+3. The TUI's **Alerts** tab shows each pending request as a card: the connection and its access level, the requesting agent (MCP `clientInfo`), the command, why it needs approval, the agent's optional justification, and a countdown bar until it is denied automatically. When a new request arrives while the TUI is open, the same card pops up over the current view. Keys: **y** approve, **m** approve & remember (see below), **n** deny (you can type a note for the agent, **Enter** sends it, **Esc** cancels), **Esc** later.
 4. If no TUI is open, tussh sends a macOS notification (`osascript`). If herdr is available (`$HERDR_BIN_PATH`, `herdr` on PATH or `~/.local/bin/herdr`), tussh also invokes the `herdr-tussh.alerts` action, which opens `tussh alerts` as a popup inside herdr. Both fail silently.
 5. Without a decision within **120 s**, the request is denied automatically, and the agent gets a clear message. You can change the timeout with `approval_timeout_seconds` in `~/.config/tussh/settings.json` or the `TUSSH_APPROVAL_TIMEOUT` environment variable.
+
+A deny note is passed to the agent with the denial (`denied by the user: <note>`) and stored in the audit log.
 
 Exactly one decision wins. Decisions are created exclusively with `link(2)`, so a late approval cannot race with the timeout. You can also approve requests from a shell: `tussh pending`, `tussh approve ID`, `tussh deny ID`. `tussh alerts` opens the TUI directly on the Alerts tab. `tussh alerts --popup` also quits once every request it showed is decided (used by the herdr popup).
 
 `~/.config/tussh/settings.json` (optional):
 
 ```json
-{ "approval_timeout_seconds": 120, "disable_notifications": false, "disable_herdr": false }
+{ "approval_timeout_seconds": 120, "disable_notifications": false, "disable_herdr": false,
+  "remember_ttl_hours": 8, "disable_audit_output": false }
 ```
+
+### Approve & remember
+
+**m** on a request approves it and also allows **exactly this command** (byte for byte) on **this connection** for a while (`remember_ttl_hours`, default 8 h, max one week). Until then, an agent that sends the identical command on that connection runs it without asking again. Anything else, even the same command with an extra space or a `; …` appended, asks as usual, and other connections are not affected. Sensitive commands can be remembered too, but only as an exact match.
+
+Remembered commands are files in `~/.local/state/tussh/allow/` (one per entry, mode 0600), so every MCP process sees them, also when no TUI is running. They show up in the connection's detail pane with their expiry; **R** selects them and **Enter** revokes one. Deleting the connection revokes its entries. The audit log records such runs as `approved` by `remembered`.
 
 ## Audit log
 
-tussh appends every agent request to `~/.local/state/tussh/audit.jsonl`. Each entry records the time, connection, access level, command, decision (`auto`, `approved`, `denied`, `timeout` or `blocked`), who decided, the reasons, the agent, the justification, the exit code, whether the command timed out, and its duration. Command output is not logged. You can browse the log in the **History** tab (**Enter** shows details).
+tussh appends every agent request to `~/.local/state/tussh/audit.jsonl` (mode 0600). Each entry records the time, connection, access level, command, decision (`auto`, `approved`, `denied`, `timeout` or `blocked`), who decided, the reasons, the agent, the justification, your deny note, the exit code, whether the command timed out, and its duration.
+
+It also keeps the **command output, bounded**: at most 4 kB of stdout and 4 kB of stderr per entry (the beginning and the end). The connection's own stored password or passphrase is replaced with `[redacted]` if it shows up in the output, but anything else a command prints (for example an approved `cat .env`) lands in the log. Set `"disable_audit_output": true` in `settings.json` to keep no output at all. Browse the log in the **History** tab.
 
 ## Connections and secrets
 
-- Connections are stored in `~/.config/tussh/connections.json` (mode 0600). Each one has a name, host, port, user, auth (`key` or `password`), a key path, an optional group and description, the access level and tunnels. **The file contains no secrets.**
+- Connections are stored in `~/.config/tussh/connections.json` (mode 0600). Each one has a name, host, port, user, auth (`key` or `password`), a key path, an optional description and **tags**, a **favorite** flag, the access level and tunnels. **The file contains no secrets.** There are no groups: put things like prod/staging in the name or in a tag. Files from older versions with a `group` field still load; the group becomes a tag and the field is dropped the next time tussh saves the file.
+- The **last use** of a connection (your interactive session or an agent command that ran) is kept in `~/.local/state/tussh/used/`, one empty file per connection whose modification time is the time of use. The MCP processes never write `connections.json`.
 - **Passwords and key passphrases** are stored in the macOS Keychain under the service `tussh` (via [go-keyring](https://github.com/zalando/go-keyring); on Linux, the Secret Service).
 - **Password auth works without prompts.** tussh starts `ssh` with `SSH_ASKPASS=<tussh binary>` and `SSH_ASKPASS_REQUIRE=force`, which requires OpenSSH 8.4 or later. ssh then calls tussh back, and tussh reads the secret from the keychain. Each ssh process gets a one-time token file in the state dir, and the askpass mode only answers for a live token. Secrets never appear in arguments, logs or the UI.
 - Key connections without a passphrase use `BatchMode=yes`. An empty key path means ssh's own defaults (ssh-agent, `~/.ssh/id_*`).
 - Host keys must already be known. Agent runs never accept a new host key, so connect once yourself from the TUI first. In interactive sessions, ssh asks you as usual.
-- **Import:** press **i** on the Connections tab to pick hosts from `~/.ssh/config`. tussh only reads that file. It resolves each host with `ssh -G` and imports it with access level `none`.
+- **Import:** press **i** on the Connections tab to pick hosts from `~/.ssh/config`. tussh only reads that file. It resolves each host with `ssh -G` and imports it with access level `none` and the tag `ssh-config`.
 
 Paths can be overridden with `TUSSH_CONFIG_DIR` and `TUSSH_STATE_DIR` (or `XDG_CONFIG_HOME`/`XDG_STATE_HOME`). The tests use `TUSSH_KEYRING=file:<path>`, a plaintext file backend. **Use it for testing only.**
 
 ## TUI
 
-| Tab | Keys |
-|---|---|
-| Connections | **Enter** connect (interactive `ssh` in this terminal; you return to the TUI afterwards) · **n** new · **e** edit · **x** delete (with confirmation; also removes the stored secrets) · **l** cycle the agent access level · **i** import from `~/.ssh/config` |
-| Tunnels | **Enter** start or stop. Tunnels run as background `ssh -N -L` processes, tracked by pid files in the state dir, so they keep running after the TUI exits. Define them in the connection form as `name=local:host:port, …`. Agents cannot start tunnels. |
-| Alerts | **a** approve · **d** deny · **Enter** details |
-| History | **Enter** details |
-| Setup | **Enter** copies the registration snippet |
-| all | **Tab**/**Shift+Tab** or **1-5** switch tabs · **q** quit |
+Every view has the same frame: the app name, the tabs (**1**–**5**) and status chips at the top (pending requests as a red badge, running tunnels, the last agent activity), and the 3–4 most relevant keys at the bottom. **?** opens an overlay with all keys. Colors come from your terminal's ANSI palette, so tussh follows your terminal theme. On terminals narrower than 90 columns, side-by-side panes are stacked.
 
-In the form: **Tab**/**↑↓** move between fields, **←→** change a choice, **Ctrl+S** save, **Esc** cancel. Leave the password or passphrase field empty to keep the stored value.
+| View | What you see | Keys |
+|---|---|---|
+| Connections | Left: the list. Favorites (★) on top, separated by a thin line, then the most recently used, then by name. Each row has a reachability dot (● reachable, ○ unreachable, ◌ checking; a plain TCP connect to host:port every 45 s, no login) and the access level (⛔ none, 👀 read-only, ✋ approve-each, ✓ trusted). Right: user@host:port, auth, reachability, last use, tags, description, the access level with a one-line explanation, the connection's tunnels with live status, remembered commands and the last agent commands. | **Enter** connect (interactive `ssh` in this terminal; you return to the TUI afterwards) · **n** new · **e** edit · **x** delete (with confirmation; also removes the stored secrets and remembered commands) · **f** favorite · **l** cycle the access level · **/** search (fuzzy on the name, substring on host, user, description and tags; **Esc** clears) · **r** check reachability now · **t** select a tunnel, **Enter** start/stop · **R** select a remembered command, **Enter** revoke · **i** import from `~/.ssh/config` |
+| Tunnels | All tunnels with status. They run as background `ssh -N -L` processes, tracked by pid files in the state dir, so they keep running after the TUI exits. Define them in the connection form as `name=local:host:port, …`. Agents cannot start tunnels. | **Enter** start or stop |
+| Alerts | The pending requests (list on the left when there are several) and the selected one as a card. | **y** approve · **m** approve & remember · **n** deny with an optional note · **↑↓** next request |
+| History | A table of agent requests: decision (✓ auto, 👍 approved, ✗ denied, ⌛ timeout, ⛔ blocked), time, connection, command, exit code and duration. The detail pane shows the full command, reasons, justification, deny note and the recorded output. | **c** cycle the connection filter · **d** cycle the decision filter · **/** search · **Esc** clear filters · **Enter** details (narrow terminals) |
+| Setup | Paths (binary, config, state, secrets) and the registration snippet per harness, with ✓ where tussh finds a `tussh` entry in the harness's user config (`~/.claude.json`, `~/.codex/config.toml`, `~/.gemini/settings.json`, `~/.config/opencode/opencode.json`, `~/.cursor/mcp.json`; files are only read, project-level registrations are not detected). | **Enter** copies the snippet |
+| all | | **Tab**/**Shift+Tab** or **1-5** switch views · **?** help · **q** quit |
+
+The connection form opens as a dialog with four sections: *Connection* (name, host, port, user, description, comma-separated tags), *Authentication* (key or password, key file, passphrase or password), *Agent access* (level with an explanation) and *Tunnels*. **Tab**/**↑↓** move between fields (Tab never switches views while a form, the search or a deny note is open), **←→** change a choice, **Ctrl+T** tests the connection, **Ctrl+S** saves, **Esc** cancels. Leave the password or passphrase field empty to keep the stored value.
+
+**Test connection** (Ctrl+T) runs `ssh … true` with the form's values, non-interactively (`BatchMode`, askpass for a password or passphrase, 5 s connect timeout, no new host keys), and shows the result in the form. It only runs when you press the key. A password you typed but did not save yet is put into the keychain under a temporary entry for the duration of the test and removed afterwards.
 
 ## MCP setup
 
@@ -140,8 +156,8 @@ MCP tools:
 
 | Tool | Does |
 |---|---|
-| `list_connections` | Returns the name, group, description and access level of every connection that is not `none`. It returns no hosts, users or secrets. |
-| `run_command(connection, command, justification?, timeout?)` | Classifies the command, then runs it, waits for approval, or refuses it. It runs `ssh -T` with `ConnectTimeout=10`, `ClearAllForwardings=yes`, `ControlPath=none` and `ForwardAgent=no`, and with stdin closed. The remote timeout defaults to 30 s (max 600 s), and on timeout the whole process group is killed. stdout and stderr are capped at 20 kB each (head and tail are kept). Returns `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated` and `decision`. |
+| `list_connections` | Returns the name, description, tags and access level of every connection that is not `none`. It returns no hosts, users or secrets. |
+| `run_command(connection, command, justification?, timeout?)` | Classifies the command, then runs it, waits for approval, or refuses it. It runs `ssh -T` with `ConnectTimeout=10`, `ClearAllForwardings=yes`, `ControlPath=none` and `ForwardAgent=no`, and with stdin closed. The remote timeout defaults to 30 s (max 600 s), and on timeout the whole process group is killed. stdout and stderr are capped at 20 kB each (head and tail are kept). Returns `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated` and `decision`. A command you remembered with **m** on this connection runs without asking again until the entry expires. |
 
 There is deliberately no tool for interactive sessions or tunnels. A broken `connections.json` exposes nothing (fail closed).
 
@@ -151,7 +167,7 @@ There is deliberately no tool for interactive sessions or tunnels. A broken `con
 - **The classifier is best-effort.** It only sees the command line, not the contents of scripts (`./deploy.sh`) or what a program does at runtime. It is conservative: when it is unsure, it asks. Treat `trusted` as "mostly delegated".
 - **Permission-skipping flags.** Harnesses started with `--dangerously-skip-permissions`, `--yolo` or similar approve every MCP call on their side. tussh's own approvals still apply, but such agents also have a local shell (see the first point).
 - **Use separate keys per area.** Use different keys for company, client and private servers, so revoking one area does not affect the others.
-- The askpass token, the approval files and the audit log all live in the state dir with mode 0600.
+- The askpass token, the approval files, the remembered commands and the audit log all live in the state dir with mode 0600. The audit log contains bounded command output unless you switch that off (see [Audit log](#audit-log)).
 
 ## Install
 
@@ -175,12 +191,15 @@ make test-unit        # same without the integration test (TUSSH_INTEGRATION=0)
 |---|---|
 | `internal/classify` | The read-only allow/deny/bypass cases ported from herdr-ssh, re-quoting, about 150 sensitive and not-sensitive cases, user rules, fail-closed invalid rules |
 | `internal/policy` | The access-level decision matrix and which command is sent |
+| `internal/allow` | Remembered commands: exact match per connection, expiry, revoke, 0600 files |
+| `internal/agent` | A remembered command runs without a request, an expired or foreign one asks again, deny notes reach the agent and the log, output capture can be switched off |
 | `internal/approval` | Submit/resolve, 30 concurrent resolvers with exactly one winner, wait/timeout/cancel, no partial reads during atomic writes, stale cleanup, TUI presence |
-| `internal/config`, `internal/secrets` | Validation (no argv injection), 0600 store without secrets, the in-memory and file keyrings |
-| `internal/sshrun` | ssh argv per auth/mode, exit codes, truncation, timeout kills the process group, askpass tokens |
-| `internal/tui` | Model-level tests: forms (secrets go to the keyring), level cycling, delete, the approval popup, Alerts, Setup copy, ssh config import |
-| `e2e_test.go` | The real binary as a stdio MCP subprocess: handshake, list, auto/approve/deny/timeout/cancel, askpass through the binary, fail-closed config, audit log |
-| `integration_test.go` | A throwaway `alpine` sshd container with a **password user and a key user**: password auth via askpass, key auth, read-only auto, approve and deny with real effects, sensitive commands on trusted, remote timeout, approval timeout, a tunnel. Skipped without docker or with `TUSSH_INTEGRATION=0`. The container, the key and the temp dirs are removed afterwards. |
+| `internal/config`, `internal/secrets` | Validation (no argv injection), 0600 store without secrets, legacy `group` → tag migration, tags, last use, the in-memory and file keyrings |
+| `internal/harness` | Snippets, read-only detection of registrations (also invalid and JSONC files) |
+| `internal/sshrun` | ssh argv per auth/mode, exit codes, truncation, timeout kills the process group, askpass tokens, the connection test with a temporary secret |
+| `internal/tui` | Model-level tests: forms (secrets go to the keyring, tags, test connection, Tab stays in the form, port placeholder), sorting and favorites, search, reachability, level cycling, delete, the approval popup, deny notes, approve & remember and revoking, history filters, Setup registration, ssh config import, and a layout test that renders every view at 140×40, 110×32 and 80×24 with colors on and checks screen size and column alignment |
+| `e2e_test.go` | The real binary as a stdio MCP subprocess: handshake, list, auto/approve/deny/timeout/cancel, remembered commands and expiry, deny notes, askpass through the binary (the secret never reaches the config or the audit log), fail-closed config, audit log |
+| `integration_test.go` | A throwaway `alpine` sshd container with a **password user and a key user**: password auth via askpass, key auth, read-only auto, approve and deny with real effects, sensitive commands on trusted, remote timeout, approval timeout, a tunnel, and the form's connection test with an unsaved password. Skipped without docker or with `TUSSH_INTEGRATION=0`. The container, the key and the temp dirs are removed afterwards. |
 
 No test touches `~/.ssh`, the real Keychain or a running herdr. CI (`.github/workflows/tests.yml`, job `tests`) runs everything on ubuntu, including the integration test.
 

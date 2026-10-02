@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baeroe/tussh/internal/allow"
 	"github.com/baeroe/tussh/internal/approval"
 	"github.com/baeroe/tussh/internal/audit"
 	"github.com/baeroe/tussh/internal/config"
@@ -238,7 +239,7 @@ func awaitPending(t *testing.T, command string) approval.Request {
 }
 
 var (
-	connRO      = config.Connection{Name: "ro", Host: "ro.example", Auth: config.AuthKey, AccessLevel: config.LevelReadOnly, Group: "test", Description: "read-only box"}
+	connRO      = config.Connection{Name: "ro", Host: "ro.example", Auth: config.AuthKey, AccessLevel: config.LevelReadOnly, Tags: []string{"test"}, Description: "read-only box"}
 	connEach    = config.Connection{Name: "each", Host: "each.example", Auth: config.AuthKey, AccessLevel: config.LevelApproveEach}
 	connTrusted = config.Connection{Name: "trusted", Host: "trusted.example", Auth: config.AuthKey, AccessLevel: config.LevelTrusted}
 	connNone    = config.Connection{Name: "secret-box", Host: "none.example", Auth: config.AuthKey, AccessLevel: config.LevelNone}
@@ -466,5 +467,42 @@ func TestCLI(t *testing.T) {
 	}
 	if err := exec.Command(tusshBin, "bogus").Run(); err == nil {
 		t.Fatal("unknown command must fail")
+	}
+}
+
+func TestMCPRememberedCommand(t *testing.T) {
+	sb := newSandbox(t)
+	sb.addConnections(t, connEach)
+	s, _ := config.Load()
+	each, _ := s.ByName("each")
+	if _, err := allow.Add(each.ID, each.Name, "systemctl reload nginx", time.Hour, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := allow.Add(each.ID, each.Name, "uptime", -time.Minute, "test"); err != nil {
+		t.Fatal(err)
+	}
+	c := startMCP(t, sb.env)
+	c.init()
+	isErr, text, sc := c.call("run_command", map[string]any{"connection": "each", "command": "systemctl reload nginx"})
+	if isErr || sc["decision"] != "approved" || sc["stdout"] != "REMOTE systemctl reload nginx\n" {
+		t.Fatalf("remembered: %s", text)
+	}
+	if len(approval.Open().Pending()) != 0 {
+		t.Fatal("a remembered command must not create a request")
+	}
+	// expired: asks again; the deny note reaches the agent
+	ch := c.send("tools/call", map[string]any{"name": "run_command", "arguments": map[string]any{"connection": "each", "command": "uptime"}})
+	r := awaitPending(t, "uptime")
+	approval.Open().Resolve(r.ID, approval.Denied, "test", "not now, the box is under maintenance")
+	isErr, text, _ = toolResult(t, c.wait(ch, 20*time.Second))
+	if !isErr || !strings.Contains(text, "not now, the box is under maintenance") {
+		t.Fatalf("deny note: %s", text)
+	}
+	entries, _ := audit.Read(0)
+	if entries[1].DecidedBy != "remembered" || entries[1].Stdout == "" || entries[0].Note == "" {
+		t.Fatalf("audit: %+v", entries)
+	}
+	if isErr, text, _ := c.call("list_connections", map[string]any{}); isErr || strings.Contains(text, `"group"`) {
+		t.Fatalf("list: %s", text)
 	}
 }

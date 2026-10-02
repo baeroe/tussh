@@ -2,8 +2,10 @@ package audit
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestAppendReadConcurrent(t *testing.T) {
@@ -28,5 +30,16 @@ func TestAppendReadConcurrent(t *testing.T) {
 	info, _ := os.Stat(File())
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", info.Mode())
+	}
+}
+
+func TestClip(t *testing.T) {
+	if s, c := Clip("short"); s != "short" || c {
+		t.Fatal("short clipped")
+	}
+	long := strings.Repeat("a", OutputCap) + strings.Repeat("ü", OutputCap)
+	s, c := Clip(long)
+	if !c || len(s) > OutputCap+100 || !strings.HasPrefix(s, "aaa") || !strings.HasSuffix(s, "üü") || !utf8.ValidString(s) {
+		t.Fatalf("clip: %v %d", c, len(s))
 	}
 }

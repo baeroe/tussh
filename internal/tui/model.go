@@ -2,14 +2,19 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/baeroe/tussh/internal/allow"
 	"github.com/baeroe/tussh/internal/approval"
 	"github.com/baeroe/tussh/internal/audit"
 	"github.com/baeroe/tussh/internal/classify"
@@ -34,6 +39,9 @@ const (
 
 var tabNames = []string{"Connections", "Tunnels", "Alerts", "History", "Setup"}
 
+// reachInterval is how often hosts are probed in the background.
+const reachInterval = 45 * time.Second
+
 // Options configure the model (tests inject fakes).
 type Options struct {
 	Tab       Tab
@@ -47,6 +55,12 @@ type Options struct {
 	NoTick    bool   // tests drive ticks manually
 	// ExitWhenDone quits once requests were shown and none are pending any more (herdr alerts popup).
 	ExitWhenDone bool
+	// Probe checks whether host:port accepts TCP connections (default: dial with a 3 s timeout).
+	Probe func(host string, port int) error
+	// TestConn runs the form's "test connection" (default sshrun.TestConnection).
+	TestConn func(c config.Connection, secret string) error
+	// Home is where harness configs are looked up for the Setup tab (default $HOME).
+	Home string
 }
 
 type tickMsg time.Time
@@ -62,6 +76,34 @@ type tunnelDoneMsg struct {
 	up  bool
 }
 
+type reachMsg struct {
+	id      string
+	ok      bool
+	latency time.Duration
+	err     string
+}
+
+type testConnMsg struct {
+	gen int
+	err error
+}
+
+type reachState int
+
+const (
+	reachUnknown reachState = iota
+	reachChecking
+	reachUp
+	reachDown
+)
+
+type reachInfo struct {
+	state   reachState
+	latency time.Duration
+	checked time.Time
+	err     string
+}
+
 // Model is the root Bubble Tea model.
 type Model struct {
 	opts    Options
@@ -74,24 +116,49 @@ type Model struct {
 
 	cursor [numTabs]int
 
-	pending []approval.Request
-	seen    map[string]bool
-	modal   *approval.Request
+	// connections
+	used         map[string]time.Time
+	rows         []config.Connection // sorted and filtered view of store.Connections
+	reach        map[string]reachInfo
+	lastReach    time.Time
+	allows       []allow.Entry
+	detailFocus  bool // the detail pane has focus (tunnels and remembered commands are selectable)
+	detailCursor int
 
-	history     []audit.Entry
-	historyOpen bool
+	// search ("/") on Connections and History
+	search    textinput.Model
+	searching bool
+	query     [numTabs]string
+
+	// alerts
+	pending  []approval.Request
+	seen     map[string]bool
+	modal    *approval.Request // popup for a new request
+	denyNote *textinput.Model  // inline note while denying
+	denyID   string
+
+	// history
+	history      []audit.Entry
+	historyMod   time.Time
+	historyOpen  bool // narrow layout: show the detail of the selected entry
+	histConn     string
+	histDecision string
 
 	tunnelState map[string]bool
 	tunnelBusy  map[string]bool
 
-	snippets []harness.Snippet
+	snippets   []harness.Snippet
+	registered map[string]bool
 
-	form    *connForm
-	confirm *config.Connection // pending delete
-	imp     *importView
+	form       *connForm
+	confirm    *config.Connection // pending delete
+	imp        *importView
+	help       bool
+	helpScroll int
 
 	status    string
 	statusErr bool
+	ticks     int
 	quitting  bool
 }
 
@@ -115,20 +182,47 @@ func New(opts Options) *Model {
 	if opts.SSHConfig == "" {
 		opts.SSHConfig = sshconfig.DefaultPath()
 	}
-	m := &Model{opts: opts, tab: opts.Tab, seen: map[string]bool{}, tunnelState: map[string]bool{}, tunnelBusy: map[string]bool{}}
+	if opts.Probe == nil {
+		opts.Probe = tcpProbe
+	}
+	if opts.TestConn == nil {
+		kr := opts.Keyring
+		opts.TestConn = func(c config.Connection, secret string) error {
+			return sshrun.TestConnection(context.Background(), c, kr, secret, 8*time.Second)
+		}
+	}
+	if opts.Home == "" {
+		opts.Home, _ = os.UserHomeDir()
+	}
+	si := textinput.New()
+	si.Prompt = "/"
+	si.Placeholder = "search"
+	si.CharLimit = 100
+	m := &Model{opts: opts, tab: opts.Tab, seen: map[string]bool{}, tunnelState: map[string]bool{}, tunnelBusy: map[string]bool{},
+		reach: map[string]reachInfo{}, search: si}
 	m.snippets = harness.Snippets(opts.Bin)
+	m.registered = harness.Registered(opts.Home)
 	m.reload()
+	m.refreshHistory()
 	m.refreshPending(false)
 	return m
 }
 
-// Init starts the refresh ticker.
+func tcpProbe(host string, port int) error {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(port)), 3*time.Second)
+	if err != nil {
+		return err
+	}
+	return c.Close()
+}
+
+// Init starts the refresh ticker and the first reachability check.
 func (m *Model) Init() tea.Cmd {
 	approval.Heartbeat()
 	if m.opts.NoTick {
 		return nil
 	}
-	return tick()
+	return tea.Batch(tick(), m.checkReach(false))
 }
 
 func tick() tea.Cmd {
@@ -143,8 +237,10 @@ func (m *Model) reload() {
 	}
 	m.store = s
 	m.rules = classify.LoadRules(config.RulesFile())
+	m.used = config.LastUsed()
+	m.allows = allow.List()
 	m.refreshTunnels()
-	m.clampCursors()
+	m.rebuildRows("")
 }
 
 func (m *Model) refreshTunnels() {
@@ -155,7 +251,25 @@ func (m *Model) refreshTunnels() {
 	}
 }
 
+func (m *Model) runningTunnels() int {
+	n := 0
+	for _, c := range m.store.Connections {
+		for _, t := range c.Tunnels {
+			if m.tunnelState[tunnelKey(c, t)] {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// refreshHistory reloads the audit log when it changed.
 func (m *Model) refreshHistory() {
+	mod := audit.LastActivity()
+	if !mod.IsZero() && mod.Equal(m.historyMod) && m.history != nil {
+		return
+	}
+	m.historyMod = mod
 	h, _ := audit.Read(500)
 	m.history = h
 	m.clampCursors()
@@ -168,8 +282,11 @@ func (m *Model) refreshPending(popup bool) {
 	for _, r := range m.pending {
 		ids[r.ID] = true
 		if !m.seen[r.ID] {
+			if popup && (m.form != nil || m.denyNote != nil) {
+				continue // pop up once the form is closed; never steal keys from a text input
+			}
 			m.seen[r.ID] = true
-			if popup && m.modal == nil {
+			if popup && m.modal == nil && m.tab != TabAlerts {
 				r := r
 				m.modal = &r
 			}
@@ -177,6 +294,10 @@ func (m *Model) refreshPending(popup bool) {
 	}
 	if m.modal != nil && !ids[m.modal.ID] {
 		m.modal = nil // decided elsewhere or timed out
+	}
+	if m.denyNote != nil && !ids[m.denyID] {
+		m.denyNote, m.denyID = nil, ""
+		m.flashErr("the request was decided elsewhere or timed out")
 	}
 	m.clampCursors()
 }
@@ -190,7 +311,7 @@ type tunnelRow struct {
 
 func (m *Model) tunnelRows() []tunnelRow {
 	var rows []tunnelRow
-	for _, c := range m.store.Connections {
+	for _, c := range m.rowsAll() {
 		for _, t := range c.Tunnels {
 			rows = append(rows, tunnelRow{c, t})
 		}
@@ -201,13 +322,13 @@ func (m *Model) tunnelRows() []tunnelRow {
 func (m *Model) rowCount(t Tab) int {
 	switch t {
 	case TabConnections:
-		return len(m.store.Connections)
+		return len(m.rows)
 	case TabTunnels:
 		return len(m.tunnelRows())
 	case TabAlerts:
 		return len(m.pending)
 	case TabHistory:
-		return len(m.history)
+		return len(m.filteredHistory())
 	case TabSetup:
 		return len(m.snippets)
 	}
@@ -241,18 +362,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case tickMsg:
-		approval.Heartbeat()
-		m.refreshPending(true)
-		if m.opts.ExitWhenDone && len(m.seen) > 0 && len(m.pending) == 0 && m.form == nil && m.imp == nil {
-			return m.quit()
+		return m.onTick(time.Time(msg))
+	case reachMsg:
+		ri := reachInfo{state: reachDown, latency: msg.latency, checked: time.Now(), err: msg.err}
+		if msg.ok {
+			ri.state = reachUp
 		}
-		if m.tab == TabHistory {
-			m.refreshHistory()
+		m.reach[msg.id] = ri
+		return m, nil
+	case testConnMsg:
+		if m.form != nil && m.form.testGen == msg.gen {
+			m.form.testing = false
+			if msg.err != nil {
+				m.form.testResult, m.form.testOK = msg.err.Error(), false
+			} else {
+				m.form.testResult, m.form.testOK = "connected, login works", true
+			}
 		}
-		if m.tab == TabTunnels && time.Time(msg).Second()%2 == 0 {
-			m.refreshTunnels()
-		}
-		return m, tick()
+		return m, nil
 	case sshDoneMsg:
 		m.reload()
 		if msg.err != nil {
@@ -278,16 +405,105 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) onTick(now time.Time) (tea.Model, tea.Cmd) {
+	m.ticks++
+	approval.Heartbeat()
+	m.refreshPending(true)
+	if m.opts.ExitWhenDone && len(m.seen) > 0 && len(m.pending) == 0 && m.form == nil && m.imp == nil {
+		return m.quit()
+	}
+	m.refreshHistory()
+	var cmds []tea.Cmd
+	if m.ticks%4 == 0 { // every 2 s
+		m.refreshTunnels()
+		m.allows = allow.List()
+		m.used = config.LastUsed()
+		m.rebuildRows(m.selectedID())
+	}
+	if m.ticks%20 == 0 {
+		m.registered = harness.Registered(m.opts.Home)
+	}
+	if now.Sub(m.lastReach) >= reachInterval {
+		cmds = append(cmds, m.checkReach(false))
+	}
+	if !m.opts.NoTick {
+		cmds = append(cmds, tick())
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// checkReach probes every connection (async; never blocks the UI).
+func (m *Model) checkReach(manual bool) tea.Cmd {
+	m.lastReach = time.Now()
+	var cmds []tea.Cmd
+	probe := m.opts.Probe
+	for _, c := range m.store.Connections {
+		ri := m.reach[c.ID]
+		if ri.state == reachChecking && !manual {
+			continue
+		}
+		ri.state = reachChecking
+		m.reach[c.ID] = ri
+		id, host, port := c.ID, c.Host, c.EffectivePort()
+		cmds = append(cmds, func() tea.Msg {
+			start := time.Now()
+			err := probe(host, port)
+			msg := reachMsg{id: id, ok: err == nil, latency: time.Since(start)}
+			if err != nil {
+				msg.err = shortNetErr(err)
+			}
+			return msg
+		})
+	}
+	return tea.Batch(cmds...)
+}
+
+func shortNetErr(err error) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "no such host"):
+		return "unknown host"
+	case strings.Contains(s, "refused"):
+		return "connection refused"
+	case strings.Contains(s, "timeout"):
+		return "timeout"
+	case strings.Contains(s, "no route"):
+		return "no route to host"
+	}
+	if i := strings.LastIndex(s, ": "); i >= 0 {
+		return s[i+2:]
+	}
+	return s
+}
+
 func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := k.String()
 	if key == "ctrl+c" {
 		return m.quit()
 	}
-	if m.modal != nil {
-		return m.modalKey(key)
+	// text inputs first: they own every key (including tab, q and digits)
+	if m.denyNote != nil {
+		return m.denyNoteKey(k)
 	}
 	if m.form != nil {
 		return m.formKey(k)
+	}
+	if m.searching {
+		return m.searchKey(k)
+	}
+	if m.help {
+		switch key {
+		case "?", "esc", "q":
+			m.help = false
+		case "down", "j":
+			m.helpScroll++
+		case "up", "k":
+			m.helpScroll = max(m.helpScroll-1, 0)
+		}
+		return m, nil
+	}
+	if m.modal != nil {
+		return m.modalKey(key)
 	}
 	if m.imp != nil {
 		return m.importKey(key)
@@ -302,13 +518,19 @@ func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.detailFocus {
+		return m.detailKey(key)
+	}
 	switch key {
 	case "q":
 		return m.quit()
-	case "tab", "right":
+	case "?":
+		m.help, m.helpScroll = true, 0
+		return m, nil
+	case "tab":
 		m.switchTab((m.tab + 1) % numTabs)
 		return m, nil
-	case "shift+tab", "left":
+	case "shift+tab":
 		m.switchTab((m.tab + numTabs - 1) % numTabs)
 		return m, nil
 	case "1", "2", "3", "4", "5":
@@ -324,6 +546,25 @@ func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor[m.tab]++
 		}
 		return m, nil
+	case "home", "g":
+		m.cursor[m.tab] = 0
+		return m, nil
+	case "end", "G":
+		m.cursor[m.tab] = max(0, m.rowCount(m.tab)-1)
+		return m, nil
+	case "/":
+		if m.tab == TabConnections || m.tab == TabHistory {
+			m.searching = true
+			m.search.SetValue(m.query[m.tab])
+			m.search.CursorEnd()
+			m.search.Focus()
+			return m, textinput.Blink
+		}
+	case "esc":
+		if m.query[m.tab] != "" {
+			m.setQuery("")
+			return m, nil
+		}
 	}
 	switch m.tab {
 	case TabConnections:
@@ -333,9 +574,7 @@ func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case TabAlerts:
 		return m.alertsKey(key)
 	case TabHistory:
-		if key == "enter" {
-			m.historyOpen = !m.historyOpen
-		}
+		return m.historyKey(key)
 	case TabSetup:
 		if key == "enter" && len(m.snippets) > 0 {
 			s := m.snippets[m.cursor[TabSetup]]
@@ -349,6 +588,44 @@ func (m *Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) searchKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "esc":
+		m.searching = false
+		m.search.Blur()
+		m.setQuery("")
+		return m, nil
+	case "enter":
+		m.searching = false
+		m.search.Blur()
+		return m, nil
+	case "tab", "shift+tab":
+		return m, nil // never switch views while typing
+	case "up", "down":
+		m.searching = false
+		m.search.Blur()
+		return m.handleKey(k)
+	}
+	var cmd tea.Cmd
+	m.search, cmd = m.search.Update(k)
+	m.setQuery(m.search.Value())
+	return m, cmd
+}
+
+func (m *Model) setQuery(q string) {
+	m.query[m.tab] = q
+	switch m.tab {
+	case TabConnections:
+		m.rebuildRows(m.selectedID())
+		if q != "" {
+			m.cursor[TabConnections] = 0
+		}
+	case TabHistory:
+		m.cursor[TabHistory] = 0
+	}
+	m.clampCursors()
+}
+
 func (m *Model) quit() (tea.Model, tea.Cmd) {
 	m.quitting = true
 	approval.ClearHeartbeat()
@@ -358,6 +635,7 @@ func (m *Model) quit() (tea.Model, tea.Cmd) {
 func (m *Model) switchTab(t Tab) {
 	m.tab = t
 	m.status = ""
+	m.detailFocus = false
 	switch t {
 	case TabHistory:
 		m.refreshHistory()
@@ -365,247 +643,40 @@ func (m *Model) switchTab(t Tab) {
 		m.refreshTunnels()
 	case TabAlerts:
 		m.refreshPending(false)
+	case TabSetup:
+		m.registered = harness.Registered(m.opts.Home)
 	}
-}
-
-func (m *Model) selectedConnection() (config.Connection, bool) {
-	if len(m.store.Connections) == 0 {
-		return config.Connection{}, false
-	}
-	return m.store.Connections[m.cursor[TabConnections]], true
-}
-
-func (m *Model) connectionsKey(key string) (tea.Model, tea.Cmd) {
-	if m.loadErr != nil && key != "enter" {
-		m.flashErr("connections.json is invalid, fix it first: %v", m.loadErr)
-		return m, nil
-	}
-	switch key {
-	case "n", "a":
-		m.form = newForm(nil)
-	case "e":
-		if c, ok := m.selectedConnection(); ok {
-			m.form = newForm(&c)
-		}
-	case "x", "delete", "D":
-		if c, ok := m.selectedConnection(); ok {
-			m.confirm = &c
-		}
-	case "l":
-		if c, ok := m.selectedConnection(); ok {
-			c.AccessLevel = nextLevel(c.Level())
-			if _, err := m.store.Upsert(c); err != nil {
-				m.flashErr("%v", err)
-			} else if err := m.store.Save(); err != nil {
-				m.flashErr("save failed: %v", err)
-			} else {
-				m.flash("%s: agent access %s", c.Name, c.AccessLevel)
-			}
-			m.selectByID(c.ID)
-		}
-	case "i":
-		m.imp = newImportView(m.opts.SSHConfig, m.store)
-	case "enter":
-		c, ok := m.selectedConnection()
-		if !ok {
-			return m, nil
-		}
-		cmd, cleanup, err := m.opts.Connect(c)
-		if err != nil {
-			m.flashErr("%v", err)
-			return m, nil
-		}
-		name := c.Name
-		return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-			cleanup()
-			return sshDoneMsg{name: name, err: err}
-		})
-	}
-	return m, nil
-}
-
-func nextLevel(l string) string {
-	for i, x := range config.Levels {
-		if x == l {
-			return config.Levels[(i+1)%len(config.Levels)]
-		}
-	}
-	return config.LevelNone
-}
-
-func (m *Model) selectByID(id string) {
-	for i, c := range m.store.Connections {
-		if c.ID == id {
-			m.cursor[TabConnections] = i
-		}
-	}
-}
-
-func (m *Model) deleteConnection(c config.Connection) {
-	for _, t := range c.Tunnels {
-		sshrun.StopTunnel(c, t)
-	}
-	_ = m.opts.Keyring.Delete(secrets.Account(c.ID, secrets.KindPassword))
-	_ = m.opts.Keyring.Delete(secrets.Account(c.ID, secrets.KindPassphrase))
-	m.store.Delete(c.ID)
-	if err := m.store.Save(); err != nil {
-		m.flashErr("save failed: %v", err)
-		return
-	}
-	m.clampCursors()
-	m.flash("deleted %s", c.Name)
 }
 
 func (m *Model) tunnelsKey(key string) (tea.Model, tea.Cmd) {
 	rows := m.tunnelRows()
-	if key != "enter" || len(rows) == 0 {
+	if (key != "enter" && key != " " && key != "space") || len(rows) == 0 {
 		return m, nil
 	}
 	r := rows[m.cursor[TabTunnels]]
-	k := tunnelKey(r.conn, r.tunnel)
+	return m, m.toggleTunnel(r.conn, r.tunnel)
+}
+
+func (m *Model) toggleTunnel(c config.Connection, t config.Tunnel) tea.Cmd {
+	k := tunnelKey(c, t)
 	if m.tunnelBusy[k] {
-		return m, nil
+		return nil
 	}
 	m.tunnelBusy[k] = true
 	running := m.tunnelState[k]
 	if running {
-		m.flash("stopping %s ...", r.tunnel.Name)
+		m.flash("stopping %s ...", t.Name)
 	} else {
-		m.flash("starting %s ...", r.tunnel.Name)
+		m.flash("starting %s ...", t.Name)
 	}
-	return m, func() tea.Msg {
+	return func() tea.Msg {
 		if running {
-			sshrun.StopTunnel(r.conn, r.tunnel)
+			sshrun.StopTunnel(c, t)
 			return tunnelDoneMsg{key: k}
 		}
-		_, err := sshrun.StartTunnel(r.conn, r.tunnel, 15*time.Second)
+		_, err := sshrun.StartTunnel(c, t, 15*time.Second)
 		return tunnelDoneMsg{key: k, err: err, up: err == nil}
 	}
-}
-
-func (m *Model) resolve(r approval.Request, decision string) {
-	err := m.opts.Queue.Resolve(r.ID, decision, "tui", "")
-	switch {
-	case err == nil:
-		m.flash("%s: %s on %s", decision, short(r.Command, 50), r.Connection)
-	case err == approval.ErrAlreadyDecided || err == approval.ErrUnknown:
-		m.flashErr("request is no longer pending (timed out or decided elsewhere)")
-	default:
-		m.flashErr("%v", err)
-	}
-	m.refreshPending(false)
-}
-
-func (m *Model) alertsKey(key string) (tea.Model, tea.Cmd) {
-	if len(m.pending) == 0 {
-		return m, nil
-	}
-	r := m.pending[m.cursor[TabAlerts]]
-	switch key {
-	case "a", "y":
-		m.resolve(r, approval.Approved)
-	case "d", "n":
-		m.resolve(r, approval.Denied)
-	case "enter":
-		rr := r
-		m.modal = &rr
-	}
-	return m, nil
-}
-
-func (m *Model) modalKey(key string) (tea.Model, tea.Cmd) {
-	r := *m.modal
-	switch key {
-	case "a", "y":
-		m.modal = nil
-		m.resolve(r, approval.Approved)
-	case "d", "n":
-		m.modal = nil
-		m.resolve(r, approval.Denied)
-	case "esc", "l":
-		m.modal = nil
-		m.switchTab(TabAlerts)
-		m.flash("request stays pending in Alerts")
-	}
-	return m, nil
-}
-
-// --- import from ~/.ssh/config ---------------------------------------------------------
-
-type importView struct {
-	hosts    []sshconfig.Host
-	selected map[int]bool
-	cursor   int
-	path     string
-}
-
-func newImportView(path string, store *config.Store) *importView {
-	v := &importView{path: path, selected: map[int]bool{}}
-	for _, h := range sshconfig.Parse(path) {
-		if _, exists := store.ByName(h.Alias); exists {
-			continue
-		}
-		v.hosts = append(v.hosts, h)
-	}
-	sort.SliceStable(v.hosts, func(i, j int) bool { return strings.ToLower(v.hosts[i].Alias) < strings.ToLower(v.hosts[j].Alias) })
-	return v
-}
-
-func (m *Model) importKey(key string) (tea.Model, tea.Cmd) {
-	v := m.imp
-	switch key {
-	case "esc", "q":
-		m.imp = nil
-	case "up", "k":
-		if v.cursor > 0 {
-			v.cursor--
-		}
-	case "down", "j":
-		if v.cursor < len(v.hosts)-1 {
-			v.cursor++
-		}
-	case " ", "space":
-		if len(v.hosts) > 0 {
-			v.selected[v.cursor] = !v.selected[v.cursor]
-		}
-	case "enter":
-		n := 0
-		var errs []string
-		for i, h := range v.hosts {
-			if !v.selected[i] {
-				continue
-			}
-			r := sshconfig.Resolve(h, v.path)
-			host := r.HostName
-			if host == "" {
-				host = r.Alias
-			}
-			c := config.Connection{Name: r.Alias, Group: "ssh-config", Host: host, Port: r.Port, User: r.User,
-				Auth: config.AuthKey, KeyPath: r.IdentityFile, AccessLevel: config.LevelNone,
-				Description: "imported from " + v.path}
-			if c.Port == 22 {
-				c.Port = 0
-			}
-			if _, err := m.store.Upsert(c); err != nil {
-				errs = append(errs, r.Alias+": "+err.Error())
-				continue
-			}
-			n++
-		}
-		if n > 0 {
-			if err := m.store.Save(); err != nil {
-				m.flashErr("save failed: %v", err)
-				return m, nil
-			}
-		}
-		m.imp = nil
-		if len(errs) > 0 {
-			m.flashErr("imported %d, skipped: %s", n, strings.Join(errs, "; "))
-		} else {
-			m.flash("imported %d connection(s) with agent access none", n)
-		}
-	}
-	return m, nil
 }
 
 func short(s string, n int) string {

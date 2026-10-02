@@ -152,11 +152,14 @@ func (t Tunnel) Spec() string {
 }
 
 // Connection is one SSH target. Secrets are not stored here.
+//
+// Older files had a "group" field; it is read as a tag (see UnmarshalJSON) and dropped on the next save.
 type Connection struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
-	Group       string   `json:"group,omitempty"`
 	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	Favorite    bool     `json:"favorite,omitempty"`
 	Host        string   `json:"host"`
 	Port        int      `json:"port,omitempty"`
 	User        string   `json:"user,omitempty"`
@@ -167,6 +170,52 @@ type Connection struct {
 	// HasPassword / HasPassphrase record whether a secret was stored in the keyring (not the secret itself).
 	HasPassword   bool `json:"has_password,omitempty"`
 	HasPassphrase bool `json:"has_passphrase,omitempty"`
+}
+
+// UnmarshalJSON reads a connection and migrates the legacy "group" field into a tag.
+func (c *Connection) UnmarshalJSON(data []byte) error {
+	type plain Connection // no methods: avoids recursion
+	var aux struct {
+		plain
+		Group string `json:"group"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*c = Connection(aux.plain)
+	if g := strings.TrimSpace(aux.Group); g != "" {
+		c.Tags = NormalizeTags(append([]string{g}, c.Tags...))
+	}
+	return nil
+}
+
+// NormalizeTags trims tags, drops empty ones and case-insensitive duplicates (first spelling wins).
+func NormalizeTags(tags []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range tags {
+		t = strings.Join(strings.Fields(t), " ")
+		k := strings.ToLower(t)
+		if t == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+// ParseTags splits a comma-separated tag list.
+func ParseTags(s string) []string { return NormalizeTags(strings.Split(s, ",")) }
+
+// HasTag reports whether the connection has the tag (case-insensitive).
+func (c Connection) HasTag(tag string) bool {
+	for _, t := range c.Tags {
+		if strings.EqualFold(t, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 // EffectivePort defaults to 22.
@@ -224,6 +273,11 @@ func (c Connection) Validate() error {
 	}
 	if strings.HasPrefix(c.KeyPath, "-") || strings.ContainsAny(c.KeyPath, "\n\r\x00") {
 		return errors.New("key path: invalid")
+	}
+	for _, t := range c.Tags {
+		if len(t) > 32 || strings.ContainsAny(t, ",\n\r\x00") || strings.TrimSpace(t) != t || t == "" {
+			return fmt.Errorf("tag %q: 1-32 characters, no commas", t)
+		}
 	}
 	if !ValidLevel(c.AccessLevel) {
 		return fmt.Errorf("access level: must be one of %s", strings.Join(Levels, ", "))
@@ -311,20 +365,10 @@ func (s *Store) SaveFile(path string) error {
 	return WriteFileAtomic(path, append(data, '\n'), 0o600)
 }
 
-// Sort orders by group, then name.
+// Sort orders by name (the TUI applies its own order: favorites, last used, name).
 func (s *Store) Sort() {
 	sort.SliceStable(s.Connections, func(i, j int) bool {
-		a, b := s.Connections[i], s.Connections[j]
-		if a.Group != b.Group {
-			if a.Group == "" {
-				return false
-			}
-			if b.Group == "" {
-				return true
-			}
-			return strings.ToLower(a.Group) < strings.ToLower(b.Group)
-		}
-		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+		return strings.ToLower(s.Connections[i].Name) < strings.ToLower(s.Connections[j].Name)
 	})
 }
 
@@ -400,6 +444,24 @@ type Settings struct {
 	ApprovalTimeoutSeconds int  `json:"approval_timeout_seconds,omitempty"`
 	DisableNotifications   bool `json:"disable_notifications,omitempty"`
 	DisableHerdr           bool `json:"disable_herdr,omitempty"`
+	// RememberTTLHours is how long "approve & remember" allows a command (default 8, max 168).
+	RememberTTLHours int `json:"remember_ttl_hours,omitempty"`
+	// DisableAuditOutput stops tussh from keeping the (bounded) command output in the audit log.
+	DisableAuditOutput bool `json:"disable_audit_output,omitempty"`
+}
+
+// DefaultRememberTTL is how long a remembered approval is valid.
+const DefaultRememberTTL = 8 * time.Hour
+
+// RememberTTL returns the configured TTL for remembered approvals.
+func (s Settings) RememberTTL() time.Duration {
+	switch {
+	case s.RememberTTLHours <= 0:
+		return DefaultRememberTTL
+	case s.RememberTTLHours > 168:
+		return 168 * time.Hour
+	}
+	return time.Duration(s.RememberTTLHours) * time.Hour
 }
 
 // DefaultApprovalTimeout is how long an agent call waits for a decision.
@@ -434,4 +496,51 @@ func (s Settings) ApprovalTimeout() time.Duration {
 		return time.Hour
 	}
 	return time.Duration(s.ApprovalTimeoutSeconds) * time.Second
+}
+
+// --- Last used -----------------------------------------------------------------
+
+// The last use of a connection (interactive session or agent command) is kept in the state dir, one empty
+// file per connection id whose mtime is the time of use. connections.json stays owned by the TUI: the MCP
+// processes never write it, so there is no read-modify-write race between processes.
+
+func usedDir() string { return filepath.Join(StateDir(), "used") }
+
+var idRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// TouchUsed records that connection id was used now.
+func TouchUsed(id string) {
+	if !idRE.MatchString(id) {
+		return
+	}
+	if err := EnsureDir(usedDir()); err != nil {
+		return
+	}
+	p := filepath.Join(usedDir(), id)
+	now := time.Now()
+	if err := os.Chtimes(p, now, now); err != nil {
+		_ = os.WriteFile(p, nil, 0o600)
+	}
+}
+
+// LastUsed returns the last use per connection id.
+func LastUsed() map[string]time.Time {
+	out := map[string]time.Time{}
+	entries, err := os.ReadDir(usedDir())
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && idRE.MatchString(e.Name()) {
+			out[e.Name()] = info.ModTime()
+		}
+	}
+	return out
+}
+
+// ForgetUsed removes the record for a deleted connection.
+func ForgetUsed(id string) {
+	if idRE.MatchString(id) {
+		_ = os.Remove(filepath.Join(usedDir(), id))
+	}
 }

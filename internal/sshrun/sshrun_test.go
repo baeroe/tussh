@@ -3,6 +3,7 @@ package sshrun
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,8 @@ const fakeSSH = `#!/bin/sh
 for a in "$@"; do printf 'ARG %s\n' "$a"; done
 last=""
 for a in "$@"; do last="$a"; done
+if [ "$FAKE_TC" = fail ]; then echo "debug1: something" >&2; echo "deploy@example.com: Permission denied (publickey)." >&2; exit 255; fi
+if [ "$FAKE_TC" = token ]; then { cat "$TUSSH_STATE_DIR/askpass/$TUSSH_ASKPASS_TOKEN"; echo; echo "$*"; } > "$FAKE_MARK"; fi
 case "$last" in
   sleep-forever) (sleep 2; echo child-survived > "$FAKE_MARK") & sleep 300 ;;
   big) i=0; while [ $i -lt 3000 ]; do echo "line $i of a long output"; i=$((i+1)); done ;;
@@ -203,5 +206,71 @@ func TestPromptKind(t *testing.T) {
 func TestClampTimeout(t *testing.T) {
 	if ClampTimeout(0) != DefaultTimeout || ClampTimeout(9999) != MaxTimeout || ClampTimeout(5) != 5*time.Second {
 		t.Fatal("clamp")
+	}
+}
+
+func TestTestConnection(t *testing.T) {
+	dir := setup(t)
+	kr := secrets.NewMem()
+	c := keyConn()
+	if err := TestConnection(context.Background(), c, kr, "", 5*time.Second); err != nil {
+		t.Fatalf("ok case: %v", err)
+	}
+	t.Setenv("FAKE_TC", "fail")
+	err := TestConnection(context.Background(), c, kr, "", 5*time.Second)
+	if err == nil || err.Error() != "deploy@example.com: Permission denied (publickey)." {
+		t.Fatalf("fail case: %v", err)
+	}
+	// an unsaved password goes to a temporary keyring account named in the askpass token, removed afterwards
+	mark := filepath.Join(dir, "mark")
+	t.Setenv("FAKE_TC", "token")
+	t.Setenv("FAKE_MARK", mark)
+	c.Auth, c.KeyPath = config.AuthPassword, ""
+	if err := TestConnection(context.Background(), c, kr, "typed-pw", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(mark)
+	first, rest, _ := strings.Cut(string(data), "\n")
+	var tf tokenFile
+	if err := json.Unmarshal([]byte(first), &tf); err != nil || !strings.HasPrefix(tf.Account, "test-") || tf.Kind != secrets.KindPassword {
+		t.Fatalf("token: %q %v", first, err)
+	}
+	if !strings.Contains(rest, "BatchMode=no") || !strings.HasSuffix(strings.TrimSpace(rest), "example.com true") || strings.Contains(string(data), "typed-pw") {
+		t.Fatalf("argv: %q", rest)
+	}
+	if _, err := kr.Get(tf.Account); err == nil {
+		t.Fatal("temporary secret not removed")
+	}
+}
+
+func TestAskpassTemporaryAccount(t *testing.T) {
+	setup(t)
+	kr := secrets.NewMem()
+	kr.Set("test-abc:password", "tmp-pw")
+	ap, err := newAskpassToken(tokenFile{ConnID: "nope", Expires: time.Now().Add(time.Minute), Account: "test-abc:password", Kind: secrets.KindPassword}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ap.Close()
+	for _, e := range ap.Env {
+		k, v, _ := strings.Cut(e, "=")
+		t.Setenv(k, v)
+	}
+	var out bytes.Buffer
+	if err := Askpass("password: ", kr, &out); err != nil || out.String() != "tmp-pw\n" {
+		t.Fatalf("%q %v", out.String(), err)
+	}
+	if err := Askpass("Enter passphrase for key: ", kr, &out); err == nil {
+		t.Fatal("kind mismatch accepted")
+	}
+	// only test- accounts can be named by a token
+	ap2, _ := newAskpassToken(tokenFile{ConnID: "x", Expires: time.Now().Add(time.Minute), Account: "c1:password", Kind: secrets.KindPassword}, false)
+	defer ap2.Close()
+	for _, e := range ap2.Env {
+		k, v, _ := strings.Cut(e, "=")
+		t.Setenv(k, v)
+	}
+	if err := Askpass("password: ", kr, &out); err == nil {
+		t.Fatal("non-test account accepted")
 	}
 }

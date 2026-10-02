@@ -54,6 +54,21 @@ func Askpass(prompt string, kr secrets.Keyring, out io.Writer) error {
 	if err := json.Unmarshal(data, &t); err != nil || time.Now().After(t.Expires) {
 		return errors.New("tussh askpass: unknown or expired token")
 	}
+	if t.Account != "" {
+		// connection test of an unsaved form: only the temporary account named by the parent
+		if !strings.HasPrefix(t.Account, "test-") || (t.Kind != secrets.KindPassword && t.Kind != secrets.KindPassphrase) {
+			return errors.New("tussh askpass: invalid token")
+		}
+		if kind != t.Kind {
+			return fmt.Errorf("tussh askpass: unexpected %s prompt", kind)
+		}
+		secret, err := kr.Get(t.Account)
+		if err != nil {
+			return errors.New("tussh askpass: no secret for this test")
+		}
+		_, err = fmt.Fprintln(out, secret)
+		return err
+	}
 	store, err := config.Load()
 	if err != nil {
 		return err

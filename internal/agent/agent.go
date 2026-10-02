@@ -9,12 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baeroe/tussh/internal/allow"
 	"github.com/baeroe/tussh/internal/approval"
 	"github.com/baeroe/tussh/internal/audit"
 	"github.com/baeroe/tussh/internal/classify"
 	"github.com/baeroe/tussh/internal/config"
 	"github.com/baeroe/tussh/internal/notify"
 	"github.com/baeroe/tussh/internal/policy"
+	"github.com/baeroe/tussh/internal/secrets"
 	"github.com/baeroe/tussh/internal/sshrun"
 )
 
@@ -41,10 +43,10 @@ func toolErr(format string, a ...any) error { return &ToolError{Msg: fmt.Sprintf
 
 // ConnectionInfo is what agents see about a connection. No hosts, users, keys or secrets.
 type ConnectionInfo struct {
-	Name        string `json:"name"`
-	Group       string `json:"group,omitempty"`
-	Description string `json:"description,omitempty"`
-	AccessLevel string `json:"access_level"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	AccessLevel string   `json:"access_level"`
 }
 
 func loadStore() (*config.Store, error) {
@@ -67,7 +69,7 @@ func (s *Service) ListConnections() ([]ConnectionInfo, error) {
 		if c.Level() == config.LevelNone {
 			continue
 		}
-		out = append(out, ConnectionInfo{Name: c.Name, Group: c.Group, Description: c.Description, AccessLevel: c.Level()})
+		out = append(out, ConnectionInfo{Name: c.Name, Tags: c.Tags, Description: c.Description, AccessLevel: c.Level()})
 	}
 	return out, nil
 }
@@ -130,6 +132,12 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 		return block(toolErr("connection %q: %s", conn.Name, strings.Join(dec.Reasons, "; ")))
 	case policy.Approval:
 		settings := config.LoadSettings()
+		if e, ok := allow.Match(conn.ID, req.Command); ok {
+			// "approve & remember": the user allowed exactly this command on this connection until e.Expires
+			entry.Decision, entry.DecidedBy = audit.Approved, "remembered"
+			entry.Reasons = append(entry.Reasons, "remembered approval until "+e.Expires.Format("2006-01-02 15:04"))
+			break
+		}
 		timeout := settings.ApprovalTimeout()
 		r := &approval.Request{
 			Created: time.Now(), Expires: time.Now().Add(timeout), Connection: conn.Name, ConnectionID: conn.ID,
@@ -160,7 +168,7 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 			_ = audit.Append(entry)
 			return nil, toolErr("not approved: nobody approved the command within %s, so it was denied automatically. Reasons it needed approval: %s. Ask the user to open tussh (Alerts tab) and try again, or change your approach.", timeout, strings.Join(dec.Reasons, "; "))
 		default:
-			entry.Decision = audit.Denied
+			entry.Decision, entry.Note = audit.Denied, d.Note
 			_ = audit.Append(entry)
 			msg := "denied by the user"
 			if d.Note != "" {
@@ -172,6 +180,7 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 		entry.Decision = audit.Auto
 	}
 
+	config.TouchUsed(conn.ID)
 	start := time.Now()
 	out, err := sshrun.Run(ctx, conn, dec.Command, sshrun.ClampTimeout(req.TimeoutSec))
 	entry.DurationMS = time.Since(start).Milliseconds()
@@ -181,6 +190,13 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 		return nil, toolErr("ssh failed: %v", err)
 	}
 	entry.ExitCode, entry.TimedOut = out.ExitCode, out.TimedOut
+	if !config.LoadSettings().DisableAuditOutput {
+		var c1, c2 bool
+		redact := storedSecrets(conn)
+		entry.Stdout, c1 = audit.Clip(redact(out.Stdout))
+		entry.Stderr, c2 = audit.Clip(redact(out.Stderr))
+		entry.OutputClipped = c1 || c2 || out.Truncated
+	}
 	_ = audit.Append(entry)
 	decision := "auto"
 	if entry.Decision == audit.Approved {
@@ -188,6 +204,28 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 	}
 	return &RunResponse{Connection: conn.Name, Decision: decision, ExitCode: out.ExitCode, Stdout: out.Stdout,
 		Stderr: out.Stderr, TimedOut: out.TimedOut, Truncated: out.Truncated}, nil
+}
+
+// storedSecrets returns a function that removes the connection's own keychain secret from text before it
+// is written to the audit log (for example a password a remote program echoed back).
+func storedSecrets(c config.Connection) func(string) string {
+	var secret string
+	kind := ""
+	switch {
+	case c.Auth == config.AuthPassword && c.HasPassword:
+		kind = secrets.KindPassword
+	case c.Auth == config.AuthKey && c.HasPassphrase:
+		kind = secrets.KindPassphrase
+	}
+	if kind != "" {
+		secret, _ = secrets.Open().Get(secrets.Account(c.ID, kind))
+	}
+	return func(s string) string {
+		if len(secret) < 4 {
+			return s
+		}
+		return strings.ReplaceAll(s, secret, "[redacted]")
+	}
 }
 
 // IsToolError reports whether err should be returned to the agent as a tool result with isError.

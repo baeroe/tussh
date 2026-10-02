@@ -2,6 +2,8 @@ package harness
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -36,5 +38,30 @@ func TestSnippets(t *testing.T) {
 	}
 	if Snippets("/path with space/tussh")[0].Text != "claude mcp add --scope user tussh -- '/path with space/tussh' mcp" {
 		t.Fatal("quoting")
+	}
+}
+
+func TestRegistered(t *testing.T) {
+	home := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(home, rel)
+		os.MkdirAll(filepath.Dir(p), 0o700)
+		os.WriteFile(p, []byte(content), 0o600)
+	}
+	if r := Registered(home); len(r) != 5 || r[Claude] || r[Codex] {
+		t.Fatalf("empty home: %v", r)
+	}
+	write(".claude.json", `{"mcpServers": {"tussh": {"command": "/x/tussh", "args": ["mcp"]}}, "projects": {}}`)
+	write(".codex/config.toml", "model = \"o3\"\n\n[mcp_servers.tussh]\ncommand = \"/x/tussh\"\n")
+	write(".gemini/settings.json", `{broken`)
+	write(".config/opencode/opencode.json", "{\n  // comment\n  \"mcp\": {\"tussh\": {\"type\": \"local\"}}\n}")
+	write(".cursor/mcp.json", `{"mcpServers": {"other": {}}}`)
+	r := Registered(home)
+	if !r[Claude] || !r[Codex] || r[Gemini] || !r[OpenCode] || r[Cursor] {
+		t.Fatalf("detection: %v", r)
+	}
+	write(".codex/config.toml", "[mcp_servers.tusshx]\n")
+	if Registered(home)[Codex] {
+		t.Fatal("prefix matched")
 	}
 }

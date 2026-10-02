@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,10 @@ type harnessT struct {
 	kr       *secrets.MemKeyring
 	clip     string
 	connects []string
+	probes   []string
+	down     map[string]bool // hosts the fake probe reports unreachable
+	tested   []config.Connection
+	lastCmd  tea.Cmd
 }
 
 func newHarness(t *testing.T, tab Tab) *harnessT {
@@ -27,9 +33,25 @@ func newHarness(t *testing.T, tab Tab) *harnessT {
 	dir := t.TempDir()
 	t.Setenv("TUSSH_CONFIG_DIR", filepath.Join(dir, "config"))
 	t.Setenv("TUSSH_STATE_DIR", filepath.Join(dir, "state"))
-	h := &harnessT{kr: secrets.NewMem()}
+	h := &harnessT{kr: secrets.NewMem(), down: map[string]bool{}}
+	home := filepath.Join(dir, "home")
+	os.MkdirAll(home, 0o700)
 	h.m = New(Options{
-		Tab: tab, Keyring: h.kr, Bin: "/opt/bin/tussh", NoTick: true,
+		Tab: tab, Keyring: h.kr, Bin: "/opt/bin/tussh", NoTick: true, Home: home,
+		Probe: func(host string, port int) error {
+			h.probes = append(h.probes, host)
+			if h.down[host] {
+				return errors.New("dial tcp: lookup " + host + ": no such host")
+			}
+			return nil
+		},
+		TestConn: func(c config.Connection, secret string) error {
+			h.tested = append(h.tested, c)
+			if secret == "wrong" {
+				return errors.New("Permission denied (password).")
+			}
+			return nil
+		},
 		Clipboard: func(s string) error { h.clip = s; return nil },
 		Connect: func(c config.Connection) (*exec.Cmd, func(), error) {
 			h.connects = append(h.connects, c.Name)
@@ -54,6 +76,10 @@ func (h *harnessT) key(keys ...string) {
 			msg = tea.KeyMsg{Type: tea.KeyEsc}
 		case "ctrl+s":
 			msg = tea.KeyMsg{Type: tea.KeyCtrlS}
+		case "ctrl+t":
+			msg = tea.KeyMsg{Type: tea.KeyCtrlT}
+		case "up":
+			msg = tea.KeyMsg{Type: tea.KeyUp}
 		case "down":
 			msg = tea.KeyMsg{Type: tea.KeyDown}
 		case "right":
@@ -63,8 +89,31 @@ func (h *harnessT) key(keys ...string) {
 		default:
 			msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 		}
-		h.m.Update(msg)
+		_, cmd := h.m.Update(msg)
+		h.lastCmd = cmd
 	}
+}
+
+// run executes a command and feeds the resulting messages back into the model (batches included).
+func (h *harnessT) run(cmd tea.Cmd) {
+	if cmd == nil {
+		return
+	}
+	msg := cmd()
+	if b, ok := msg.(tea.BatchMsg); ok {
+		for _, c := range b {
+			h.run(c)
+		}
+		return
+	}
+	switch msg.(type) {
+	case nil, tea.QuitMsg:
+		return
+	}
+	if fmt.Sprintf("%T", msg) == "cursor.BlinkMsg" || fmt.Sprintf("%T", msg) == "cursor.initialBlinkMsg" {
+		return
+	}
+	h.m.Update(msg) // follow-up commands (blinks, ticks) are not run
 }
 
 // focusField moves the form focus to field i.
@@ -86,7 +135,7 @@ func TestCreatePasswordConnection(t *testing.T) {
 		t.Fatal("form not open")
 	}
 	h.typeIn(fName, "shop-prod")
-	h.typeIn(fGroup, "lulububu")
+	h.typeIn(fTags, "shop, prod")
 	h.typeIn(fHost, "shop.example.com")
 	h.typeIn(fPort, "2222")
 	h.typeIn(fUser, "deploy")
@@ -205,12 +254,12 @@ func TestModalApprove(t *testing.T) {
 		t.Fatal("no modal for new request")
 	}
 	v := h.m.View()
-	for _, want := range []string{"Agent approval request", "rm -rf /tmp/cache", "claude-code", "cleanup", "deletes files"} {
+	for _, want := range []string{"Approval request", "rm -rf /tmp/cache", "claude-code", "cleanup", "deletes files", "left, then auto-deny"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("modal misses %q", want)
 		}
 	}
-	h.key("a")
+	h.key("y")
 	d, err := approval.Open().Decision(r.ID)
 	if err != nil || d.Decision != approval.Approved || d.By != "tui" {
 		t.Fatalf("decision: %+v %v", d, err)
@@ -233,12 +282,12 @@ func TestModalLaterThenDenyInAlerts(t *testing.T) {
 	if h.m.modal != nil || h.m.tab != TabAlerts {
 		t.Fatal("esc should close the modal and show Alerts")
 	}
-	if !strings.Contains(h.m.View(), "Alerts (1)") {
-		t.Fatal("badge missing")
+	if !strings.Contains(h.m.View(), "1 pending") {
+		t.Fatal("pending chip missing")
 	}
-	h.key("d")
+	h.key("n", "enter") // deny without a note
 	d, _ := approval.Open().Decision(r.ID)
-	if d == nil || d.Decision != approval.Denied {
+	if d == nil || d.Decision != approval.Denied || d.Note != "" {
 		t.Fatalf("deny: %+v", d)
 	}
 }
@@ -339,7 +388,7 @@ func TestExitWhenDone(t *testing.T) {
 	if h.m.quitting {
 		t.Fatal("quit while a request is pending")
 	}
-	h.key("a")
+	h.key("y")
 	_ = r
 	h.m.Update(tickMsg(time.Now()))
 	if !h.m.quitting {

@@ -5,6 +5,7 @@ package main
 // The container, the generated key and all temp dirs are removed afterwards.
 
 import (
+	"context"
 	"net"
 	"os"
 	"os/exec"
@@ -130,6 +131,21 @@ func TestIntegrationSSHD(t *testing.T) {
 		_, _, sc = c.call("run_command", map[string]any{"connection": "pw-ro", "command": "ls /home/*"})
 		if sc["exit_code"].(float64) == 0 {
 			t.Fatalf("glob was expanded: %v", sc)
+		}
+	})
+
+	t.Run("form connection test with an unsaved password", func(t *testing.T) {
+		kr := secrets.Open()
+		unsaved := pwConn
+		unsaved.ID, unsaved.HasPassword = "", false
+		if err := sshrun.TestConnection(context.Background(), unsaved, kr, pwPassword, 20*time.Second); err != nil {
+			t.Fatalf("right password: %v", err)
+		}
+		if err := sshrun.TestConnection(context.Background(), unsaved, kr, "wrong-password", 20*time.Second); err == nil {
+			t.Fatal("wrong password accepted")
+		}
+		if err := sshrun.TestConnection(context.Background(), keyConn, kr, "", 20*time.Second); err != nil {
+			t.Fatalf("key: %v", err)
 		}
 	})
 

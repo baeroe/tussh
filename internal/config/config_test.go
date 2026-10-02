@@ -113,3 +113,73 @@ func TestDirsAndSettings(t *testing.T) {
 		t.Fatal("env timeout")
 	}
 }
+
+func TestLegacyGroupBecomesTag(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TUSSH_CONFIG_DIR", dir)
+	legacy := `{"version": 1, "connections": [
+  {"id": "a1", "name": "web", "group": "lulububu", "host": "web.example", "auth": "key", "access_level": "read-only"},
+  {"id": "b2", "name": "db", "group": "Prod", "tags": ["prod", "mysql"], "host": "db.example", "auth": "key", "access_level": "none"},
+  {"id": "c3", "name": "plain", "host": "p.example", "auth": "key", "access_level": "none", "favorite": true}
+]}`
+	os.WriteFile(ConnectionsFile(), []byte(legacy), 0o600)
+	s, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, _ := s.ByName("web")
+	db, _ := s.ByName("db")
+	plain, _ := s.ByName("plain")
+	if strings.Join(web.Tags, ",") != "lulububu" || strings.Join(db.Tags, ",") != "Prod,mysql" || len(plain.Tags) != 0 || !plain.Favorite {
+		t.Fatalf("migration: %v %v %v", web.Tags, db.Tags, plain.Tags)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(ConnectionsFile())
+	if strings.Contains(string(data), `"group"`) || !strings.Contains(string(data), `"lulububu"`) {
+		t.Fatalf("saved: %s", data)
+	}
+}
+
+func TestTags(t *testing.T) {
+	if got := strings.Join(ParseTags(" prod, shop ,, PROD,  two  words "), "|"); got != "prod|shop|two words" {
+		t.Fatal(got)
+	}
+	c := valid()
+	c.Tags = []string{"ok", "a,b"}
+	if c.Validate() == nil {
+		t.Fatal("comma in tag accepted")
+	}
+	c.Tags = []string{strings.Repeat("x", 33)}
+	if c.Validate() == nil {
+		t.Fatal("long tag accepted")
+	}
+	if !(Connection{Tags: []string{"Prod"}}).HasTag("prod") {
+		t.Fatal("HasTag")
+	}
+}
+
+func TestLastUsed(t *testing.T) {
+	t.Setenv("TUSSH_STATE_DIR", t.TempDir())
+	if len(LastUsed()) != 0 {
+		t.Fatal("not empty")
+	}
+	TouchUsed("abc")
+	TouchUsed("../evil")
+	u := LastUsed()
+	if len(u) != 1 || time.Since(u["abc"]) > time.Minute {
+		t.Fatalf("%v", u)
+	}
+	ForgetUsed("abc")
+	if len(LastUsed()) != 0 {
+		t.Fatal("not forgotten")
+	}
+}
+
+func TestRememberTTL(t *testing.T) {
+	if (Settings{}).RememberTTL() != 8*time.Hour || (Settings{RememberTTLHours: 2}).RememberTTL() != 2*time.Hour ||
+		(Settings{RememberTTLHours: 1000}).RememberTTL() != 168*time.Hour {
+		t.Fatal("ttl")
+	}
+}
