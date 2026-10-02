@@ -9,8 +9,6 @@ A terminal SSH connection manager for **you** and an MCP server for your **AI ag
 
 *Connections: favorites on top, reachability, access levels, and the selected connection with its tunnels and recent agent commands.*
 
-tussh is a single Go binary and needs nothing else at runtime. It works without [herdr](https://herdr.dev). If you use herdr, [herdr-tussh](https://github.com/baeroe/herdr-tussh) adds key bindings to open it.
-
 ## Why
 
 When an agent can `ssh` into your servers, it holds the same rights you do. tussh puts a policy layer in between: read-only commands can run automatically, risky ones need your approval, and connections you never shared stay invisible to agents. Every agent request is logged.
