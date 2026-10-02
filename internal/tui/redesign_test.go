@@ -99,20 +99,20 @@ func TestSortFavoritesThenLastUsedThenName(t *testing.T) {
 
 func TestSearchFiltersAndOwnsKeys(t *testing.T) {
 	h := newHarness(t, TabConnections)
-	addConns(t, h, config.Connection{Name: "shop-prod", Host: "10.0.0.1", User: "deploy", Tags: []string{"lulububu"}},
+	addConns(t, h, config.Connection{Name: "shop-prod", Host: "10.0.0.1", User: "deploy", Tags: []string{"acme"}},
 		config.Connection{Name: "homelab", Host: "nas.local", Description: "Synology"},
 		config.Connection{Name: "client-web", Host: "web.client.example"})
 	h.key("/")
 	if !h.m.searching {
 		t.Fatal("search not open")
 	}
-	h.key("l", "u", "l", "u")
+	h.key("a", "c", "m", "e")
 	if got := names(h); got != "shop-prod" {
 		t.Fatalf("tag search: %s", got)
 	}
 	// tab, digits and q go into the search, they do not switch views or quit
 	h.key("tab", "1", "q")
-	if h.m.tab != TabConnections || h.m.quitting || h.m.query[TabConnections] != "lulu1q" {
+	if h.m.tab != TabConnections || h.m.quitting || h.m.query[TabConnections] != "acme1q" {
 		t.Fatalf("keys leaked: tab=%v query=%q", h.m.tab, h.m.query[TabConnections])
 	}
 	h.key("esc")

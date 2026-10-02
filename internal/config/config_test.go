@@ -118,7 +118,7 @@ func TestLegacyGroupBecomesTag(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TUSSH_CONFIG_DIR", dir)
 	legacy := `{"version": 1, "connections": [
-  {"id": "a1", "name": "web", "group": "lulububu", "host": "web.example", "auth": "key", "access_level": "read-only"},
+  {"id": "a1", "name": "web", "group": "acme", "host": "web.example", "auth": "key", "access_level": "read-only"},
   {"id": "b2", "name": "db", "group": "Prod", "tags": ["prod", "mysql"], "host": "db.example", "auth": "key", "access_level": "none"},
   {"id": "c3", "name": "plain", "host": "p.example", "auth": "key", "access_level": "none", "favorite": true}
 ]}`
@@ -130,14 +130,14 @@ func TestLegacyGroupBecomesTag(t *testing.T) {
 	web, _ := s.ByName("web")
 	db, _ := s.ByName("db")
 	plain, _ := s.ByName("plain")
-	if strings.Join(web.Tags, ",") != "lulububu" || strings.Join(db.Tags, ",") != "Prod,mysql" || len(plain.Tags) != 0 || !plain.Favorite {
+	if strings.Join(web.Tags, ",") != "acme" || strings.Join(db.Tags, ",") != "Prod,mysql" || len(plain.Tags) != 0 || !plain.Favorite {
 		t.Fatalf("migration: %v %v %v", web.Tags, db.Tags, plain.Tags)
 	}
 	if err := s.Save(); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(ConnectionsFile())
-	if strings.Contains(string(data), `"group"`) || !strings.Contains(string(data), `"lulububu"`) {
+	if strings.Contains(string(data), `"group"`) || !strings.Contains(string(data), `"acme"`) {
 		t.Fatalf("saved: %s", data)
 	}
 }
