@@ -5,6 +5,10 @@ A terminal SSH connection manager for **you** and an MCP server for your **AI ag
 - **You** run `tussh` in any terminal. You can add, edit and delete SSH connections (password or key), press **Enter** to open an interactive session, start and stop port forwards, approve or deny agent requests, and read the audit history.
 - **Agents** connect through `tussh mcp` (stdio). They only see the connections you shared with them. Each command is run automatically, sent to you for approval, or refused, depending on the connection's **access level** and on the **sensitive command rules**.
 
+![tussh: the connection list with access levels, the selected connection's details and the last agent commands](docs/screenshots/connections.png)
+
+*Connections: favorites on top, reachability, access levels, and the selected connection with its tunnels and recent agent commands.*
+
 tussh is a single Go binary and needs nothing else at runtime. It works without [herdr](https://herdr.dev). If you use herdr, [herdr-tussh](https://github.com/baeroe/herdr-tussh) adds key bindings to open it.
 
 ## Why
@@ -83,6 +87,10 @@ If the file is invalid (broken JSON, an unknown field or a bad regex), **every**
 1. An agent calls `run_command`. tussh classifies the command and applies the access level.
 2. If the command needs approval, tussh writes a request to `~/.local/state/tussh/approvals/` (files with mode 0600 and atomic writes), and the MCP call **blocks**.
 3. The TUI's **Alerts** tab shows each pending request as a card: the connection and its access level, the requesting agent (MCP `clientInfo`), the command, why it needs approval, the agent's optional justification, and a countdown bar until it is denied automatically. When a new request arrives while the TUI is open, the same card pops up over the current view. Keys: **y** approve, **m** approve & remember (see below), **n** deny (you can type a note for the agent, **Enter** sends it, **Esc** cancels), **Esc** later.
+
+   ![The Alerts tab: two pending requests, the selected one as a card with the reasons, the agent's justification and the countdown](docs/screenshots/alerts.png)
+
+   *Alerts: pending agent requests with the reasons, the agent's justification and the auto-deny countdown.*
 4. If no TUI is open, tussh sends a macOS notification (`osascript`). It fails silently.
 5. Without a decision within **120 s**, the request is denied automatically, and the agent gets a clear message. You can change the timeout with `approval_timeout_seconds` in `~/.config/tussh/settings.json` or the `TUSSH_APPROVAL_TIMEOUT` environment variable.
 
@@ -109,6 +117,10 @@ tussh appends every agent request to `~/.local/state/tussh/audit.jsonl` (mode 06
 
 It also keeps the **command output, bounded**: at most 4 kB of stdout and 4 kB of stderr per entry (the beginning and the end). The connection's own stored password or passphrase is replaced with `[redacted]` if it shows up in the output, but anything else a command prints (for example an approved `cat .env`) lands in the log. Set `"disable_audit_output": true` in `settings.json` to keep no output at all. Browse the log in the **History** tab.
 
+![The History tab: every agent request with its decision, and the details of a denied one with the deny note](docs/screenshots/history.png)
+
+*History: the audit log; the selected request was denied with a note for the agent.*
+
 ## Connections and secrets
 
 - Connections are stored in `~/.config/tussh/connections.json` (mode 0600). Each one has a name, host, port, user, auth (`key` or `password`), a key path, an optional description and **tags**, a **favorite** flag, the access level and tunnels. **The file contains no secrets.** There are no groups: put things like prod/staging in the name or in a tag. Files from older versions with a `group` field still load; the group becomes a tag and the field is dropped the next time tussh saves the file.
@@ -126,6 +138,10 @@ Paths can be overridden with `TUSSH_CONFIG_DIR` and `TUSSH_STATE_DIR` (or `XDG_C
 
 Every view has the same frame: the app name, the tabs (**1**–**5**) and status chips at the top (pending requests as a red badge, running tunnels, the last agent activity), and the 3–4 most relevant keys at the bottom. **?** opens an overlay with all keys. Colors come from your terminal's ANSI palette, so tussh follows your terminal theme. On terminals narrower than 90 columns, side-by-side panes are stacked.
 
+![A short tour: connections, search, a pending approval request and the history](docs/screenshots/tour.gif)
+
+*Connections, search, an approval request and the history.*
+
 | View | What you see | Keys |
 |---|---|---|
 | Connections | Left: the list. Favorites (★) on top, separated by a thin line, then the most recently used, then by name. Each row has a reachability dot (● reachable, ○ unreachable, ◌ checking; a plain TCP connect to host:port every 45 s, no login) and the access level (⛔ none, 👀 read-only, ✋ approve-each, ✓ trusted). Right: user@host:port, auth, reachability, last use, tags, description, the access level with a one-line explanation, the connection's tunnels with live status, remembered commands and the last agent commands. | **Enter** connect (interactive `ssh` in this terminal; you return to the TUI afterwards) · **e** edit · **n** new · **x** delete (with confirmation; also removes the stored secrets and remembered commands) · **f** favorite · **l** cycle the access level · **/** search (fuzzy on the name, substring on host, user, description and tags; **Esc** clears) · **r** check reachability now · **t** select a tunnel, **Enter** start/stop · **R** select a remembered command, **Enter** revoke · **i** import from `~/.ssh/config` |
@@ -138,6 +154,10 @@ Every view has the same frame: the app name, the tabs (**1**–**5**) and status
 The connection form opens as a dialog with four sections: *Connection* (name, host, port, user, description, comma-separated tags), *Authentication* (key or password, key file, passphrase or password), *Agent access* (level with an explanation) and *Tunnels*. **Tab**/**↑↓** move between fields (Tab never switches views while a form, the search or a deny note is open), **←→** change a choice, **Ctrl+T** tests the connection, **Ctrl+S** saves, **Esc** cancels. Leave the password or passphrase field empty to keep the stored value.
 
 **Key file field.** While it has focus, a list below it shows the private keys tussh finds in `~/.ssh` (`$TUSSH_SSH_DIR` overrides the directory): the path, the key type and comment from the matching `.pub`, and *passphrase* for encrypted keys. A file counts as a private key when it starts with an OpenSSH or PEM `PRIVATE KEY` header; tussh only reads the first bytes (the header and, for OpenSSH keys, the public part) and never shows key material. `.pub` files, `known_hosts*`, `config`, `authorized_keys*`, sockets and directories are skipped. What you type filters the list (substring or fuzzy on the path and comment). **Ctrl+N**/**Ctrl+P** highlight a key and **Enter** puts it into the field (Enter does not save while a key is highlighted, **Ctrl+S** still does; **Esc** removes the highlight). While you type a path, the rest of the best match appears as faint text (private keys first, then directories; `~` is expanded, directories end in `/`); **→** at the end of the input or **Ctrl+F** accepts it. Tab still moves to the next field. Below the field a hint checks the file: ✓ a valid private key (type · comment), ✗ file not found, ✗ a public key (`.pub`), ⚠ permissions too open (`chmod 600`), ⚠ encrypted without a passphrase. An empty field means ssh's defaults (ssh-agent, `~/.ssh/id_*`).
+
+![The connection form with the private keys found in ~/.ssh below the key file field](docs/screenshots/form.png)
+
+*The connection form suggests the private keys it finds in `~/.ssh`.*
 
 **Test connection** (Ctrl+T) runs `ssh … true` with the form's values, non-interactively (`BatchMode`, askpass for a password or passphrase, 5 s connect timeout, no new host keys), and shows the result in the form. It only runs when you press the key. A password you typed but did not save yet is put into the keychain under a temporary entry for the duration of the test and removed afterwards.
 
@@ -209,6 +229,17 @@ make test-unit        # same without the integration test (TUSSH_INTEGRATION=0)
 | `integration_test.go` | A throwaway `alpine` sshd container with a **password user and a key user**: password auth via askpass, key auth, read-only auto, approve and deny with real effects, sensitive commands on trusted, remote timeout, approval timeout, a tunnel, and the form's connection test with an unsaved password. Skipped without docker or with `TUSSH_INTEGRATION=0`. The container, the key and the temp dirs are removed afterwards. |
 
 No test touches `~/.ssh`, the real Keychain or a running herdr. CI (`.github/workflows/tests.yml`, job `tests`) runs everything on ubuntu, including the integration test.
+
+## Screenshots
+
+The images in `docs/screenshots/` are rendered from the [VHS](https://github.com/charmbracelet/vhs) tapes in `docs/tapes/` with demo data only:
+
+```sh
+brew install vhs pngquant oxipng   # vhs pulls ttyd and ffmpeg
+make screenshots                   # or: bash docs/screenshots.sh alerts
+```
+
+`docs/screenshots.sh` builds tussh into a throwaway sandbox (its own `HOME`, config and state dirs, a file keyring, demo keys made by `ssh-keygen`), seeds it with `docs/demo/seed.go` (connections on `*.example` hosts, last use, a remembered command, an audit log), and starts a real `tussh mcp` that adds an agent-created connection and leaves two approval requests pending. The tapes run `docs/demo/tui.go`, the normal TUI with a simulated reachability check because the demo hosts do not exist. The sandbox is removed afterwards. Re-render the screenshots in the same PR when the UI changes visibly.
 
 ## License
 
