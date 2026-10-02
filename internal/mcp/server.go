@@ -28,7 +28,10 @@ const instructions = "SSH access to the user's servers through tussh. Call list_
 	"approval), trusted (commands run immediately). Sensitive commands (reading secrets, deleting, destructive " +
 	"database/docker/service operations, permission changes, package removal, curl|sh, ...) always wait for approval. " +
 	"Pass a short justification so the user can decide quickly. A denied or timed-out request must not be retried " +
-	"unchanged and must never be worked around; ask the user instead."
+	"unchanged and must never be worked around; ask the user instead. new_connection adds a connection to the " +
+	"user's list (name, host, port, user, description, tags, tunnels only). It starts with access level none and " +
+	"no credentials, so it is not usable and not listed until the user sets the authentication and an access " +
+	"level in tussh; tell the user it is waiting for their setup."
 
 type rpcMsg struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -198,6 +201,22 @@ func tools() []map[string]any {
 				"timeout":       map[string]any{"type": "integer", "minimum": 1, "maximum": int(sshrun.MaxTimeout.Seconds()), "description": fmt.Sprintf("Seconds before the remote command is killed (default %d). Approval waiting time does not count.", int(sshrun.DefaultTimeout.Seconds()))},
 			}, "connection", "command"),
 		},
+		{
+			"name": "new_connection",
+			"description": "Add a new SSH connection to the user's tussh list. You can set only name, host, port, user, description, tags and tunnels; " +
+				"the access level, the authentication method, key files and secrets are set by the user and cannot be passed. " +
+				"The connection is created with access level none and no credentials: it is NOT usable and does not appear in list_connections " +
+				"until the user opens tussh, sets the authentication (key or password) and an access level. The user is notified.",
+			"inputSchema": schema(map[string]any{
+				"name":        map[string]any{"type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$", "description": "Unique connection name, e.g. shop-staging (letters, digits, _ . @ -)."},
+				"host":        map[string]any{"type": "string", "maxLength": 255, "description": "Host name or IP address."},
+				"port":        map[string]any{"type": "integer", "minimum": 1, "maximum": 65535, "description": "SSH port (default 22)."},
+				"user":        map[string]any{"type": "string", "maxLength": 64, "description": "Remote user (empty: ssh default)."},
+				"description": map[string]any{"type": "string", "maxLength": 500, "description": "Optional description; also shown to agents once the user shares the connection."},
+				"tags":        map[string]any{"type": "array", "maxItems": 16, "items": map[string]any{"type": "string", "maxLength": 32}, "description": "Free-text tags, e.g. [\"prod\", \"shop\"]."},
+				"tunnels":     map[string]any{"type": "array", "maxItems": 16, "items": map[string]any{"type": "string"}, "description": "Local port forwards, one per item: name=[bind:]local:host:port, e.g. mysql=3307:127.0.0.1:3306."},
+			}, "name", "host"),
+		},
 	}
 }
 
@@ -256,6 +275,16 @@ func (s *Server) callTool(ctx context.Context, m rpcMsg) {
 		if err != nil {
 			if !agent.IsToolError(err) {
 				s.logger.Printf("run_command: %v", err)
+			}
+			s.reply(m.ID, textResult(err.Error(), true))
+			return
+		}
+		s.reply(m.ID, textResult(res, false))
+	case "new_connection":
+		res, err := s.svc.NewConnection(p.Arguments)
+		if err != nil {
+			if !agent.IsToolError(err) {
+				s.logger.Printf("new_connection: %v", err)
 			}
 			s.reply(m.ID, textResult(err.Error(), true))
 			return

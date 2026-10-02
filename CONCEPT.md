@@ -12,7 +12,7 @@ tussh succeeds the herdr-ssh prototype (a Python herdr plugin). It keeps that pl
 | Tunnels | Tunnels tab | none |
 | Approvals | Alerts tab and popup, `tussh approve/deny` | blocking `run_command` |
 
-The TUI and any number of MCP processes share state only through files in the state dir: `approvals/`, `allow/` (remembered commands), `audit.jsonl`, `tunnels/`, `askpass/`, `used/` (last use per connection) and `tui/` (heartbeats that tell an MCP process whether a TUI is open). Only the TUI writes `connections.json`.
+The TUI and any number of MCP processes share state only through files in the state dir: `approvals/`, `allow/` (remembered commands), `audit.jsonl`, `tunnels/`, `askpass/`, `used/` (last use per connection) and `tui/` (heartbeats that tell an MCP process whether a TUI is open). `connections.json` is written by the TUI and by the MCP tool `new_connection`, always as a locked read-modify-write (`flock` on `connections.json.lock` + atomic rename); the TUI reloads it when it changes.
 
 ## Decisions
 
@@ -25,13 +25,15 @@ The TUI and any number of MCP processes share state only through files in the st
 - **`~/.config` on macOS too**, because this is a terminal tool and the files should be easy to find.
 - **A flat connection list, no groups or environments.** Favorites on top, then most recently used. Tags are free text for search; prod/staging go into the name or a tag. Old `group` values are migrated to tags.
 - **Remembered approvals are exact.** "Approve & remember" allows one exact command string on one connection until an expiry (default 8 h). No patterns or prefixes: anything that differs asks again. The entries are files in the state dir, so the separate MCP processes check them before creating a request.
-- **Last use lives in the state dir**, not in `connections.json`, so MCP processes never write the connection file and cannot race with the TUI.
+- **Last use lives in the state dir**, not in `connections.json`, so frequent agent runs never write the connection file.
+- **Agents may propose connections, never trust.** `new_connection` lets an agent add name, host, port, user, description, tags and tunnels. Access level, auth method, key file and secrets are not in the schema and are rejected if sent. The connection starts at `none` with `needs_setup`, so it is invisible to agents until the user sets it up; the user is notified like for an approval.
 - **Reachability is a plain TCP connect** to host:port (no ssh, no login), in the background every 45 s and on `r`.
 - **ANSI palette colors only**, so the TUI follows the terminal theme. Icons are limited to characters whose width all width tables agree on (default-emoji-presentation emoji are 2 cells, symbols 1), so columns stay aligned in Ghostty, herdr and elsewhere: 👀 stands for read-only and ⌛ for timeout instead of 👁/⏱, whose width depends on the terminal.
 
 ## Out of scope for now
 
 - Agents starting tunnels, or an interactive session for agents (`open_pane`)
+- Agents editing or deleting connections (they can only add new ones with `new_connection`)
 - `request_status` / asynchronous approvals. Today `run_command` blocks until it is decided or times out, so a harness with a shorter tool timeout than the approval timeout gives up first.
 - Approving an edited command, and remembering command patterns or prefixes (remembering is exact-match only)
 - Switching off built-in rules, per-connection rule sets, and safe-pipe allowlisting for read-only (`| grep`, `| head`)
@@ -49,6 +51,8 @@ The TUI and any number of MCP processes share state only through files in the st
 - Alerts as cards with a countdown, deny with a note for the agent, approve & remember with revocation in the detail pane
 - History as a filterable table with a detail pane and bounded output in the audit log (the connection's own secret is redacted; can be switched off)
 - Setup shows paths with `~` and detects existing registrations by reading the harness configs
+- Key file autocomplete in the form (detected keys, path completion, validation hint)
+- `new_connection` MCP tool: agents add connections at level `none` that the user sets up
 
 ## Open questions
 

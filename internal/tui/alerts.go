@@ -92,6 +92,11 @@ func (m *Model) denyNoteKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) alertsKey(key string) (tea.Model, tea.Cmd) {
 	if len(m.pending) == 0 {
+		if ns := m.needsSetup(); key == "e" && len(ns) > 0 {
+			c := ns[0]
+			m.selectByID(c.ID)
+			m.form = newForm(&c, m.opts.Home, m.opts.SSHDir)
+		}
 		return m, nil
 	}
 	r := m.pending[m.cursor[TabAlerts]]
@@ -282,6 +287,17 @@ func (m *Model) alertsView(w, h int) string {
 		lines := []string{"", dimStyle.Render(" No pending approval requests."), "",
 			dimStyle.Render(" Requests from agents appear here (and as a popup in the other tabs)."),
 			dimStyle.Render(" Without an open tussh you get a notification and, in herdr, a popup.")}
+		if ns := m.needsSetup(); len(ns) > 0 {
+			lines = append(lines, "", warnStyle.Bold(true).Render(fmt.Sprintf(" New connections from agents (%d) need setup", len(ns))))
+			for _, c := range ns {
+				when := ""
+				if !c.CreatedAt.IsZero() {
+					when = " · " + ago(c.CreatedAt)
+				}
+				lines = append(lines, " "+warnStyle.Render("•")+" "+boldStyle.Render(oneLine(c.Name))+" "+dimStyle.Render(oneLine(c.Target())+" · by "+agentName(c)+when))
+			}
+			lines = append(lines, " "+keyHints("e", "set up "+oneLine(ns[0].Name)+" (authentication and access level)"))
+		}
 		return panel("Alerts", lines, w, h, true, "")
 	}
 	sel := m.cursor[TabAlerts]

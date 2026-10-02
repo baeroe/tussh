@@ -10,7 +10,7 @@ import (
 	"github.com/baeroe/tussh/internal/audit"
 )
 
-var decisionFilters = []string{"", audit.Auto, audit.Approved, audit.Denied, audit.Timeout, audit.Blocked}
+var decisionFilters = []string{"", audit.Auto, audit.Approved, audit.Denied, audit.Timeout, audit.Blocked, audit.Created}
 
 func decisionIcon(e audit.Entry) string {
 	switch e.Decision {
@@ -24,6 +24,8 @@ func decisionIcon(e audit.Entry) string {
 		return icon2("⌛")
 	case audit.Blocked:
 		return icon2("⛔")
+	case audit.Created:
+		return accentStyle.Render(icon2("+"))
 	}
 	return icon2("?")
 }

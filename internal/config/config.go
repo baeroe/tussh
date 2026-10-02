@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -170,7 +171,17 @@ type Connection struct {
 	// HasPassword / HasPassphrase record whether a secret was stored in the keyring (not the secret itself).
 	HasPassword   bool `json:"has_password,omitempty"`
 	HasPassphrase bool `json:"has_passphrase,omitempty"`
+	// CreatedBy is "agent" for connections an agent created with the MCP tool new_connection;
+	// CreatedAgent is the harness (MCP clientInfo name and version), if known.
+	CreatedBy    string    `json:"created_by,omitempty"`
+	CreatedAgent string    `json:"created_agent,omitempty"`
+	CreatedAt    time.Time `json:"created_at,omitzero"`
+	// NeedsSetup is set on agent-created connections until the user saved them in the form.
+	NeedsSetup bool `json:"needs_setup,omitempty"`
 }
+
+// CreatedByAgent is the CreatedBy value of connections made by the new_connection tool.
+const CreatedByAgent = "agent"
 
 // UnmarshalJSON reads a connection and migrates the legacy "group" field into a tag.
 func (c *Connection) UnmarshalJSON(data []byte) error {
@@ -312,6 +323,53 @@ func (t Tunnel) Validate() error {
 	return nil
 }
 
+// FormatTunnels renders tunnels as "name=[bind:]local:host:port, ...".
+func FormatTunnels(ts []Tunnel) string {
+	var parts []string
+	for _, t := range ts {
+		s := fmt.Sprintf("%s=%d:%s:%d", t.Name, t.Local, t.RemoteHost, t.RemotePort)
+		if t.Bind != "" && t.Bind != "127.0.0.1" {
+			s = fmt.Sprintf("%s=%s:%d:%s:%d", t.Name, t.Bind, t.Local, t.RemoteHost, t.RemotePort)
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ParseTunnels parses "name=[bind:]local:host:port, ..." (the syntax of the form and of new_connection).
+// The tunnels are not validated here; Connection.Validate does that.
+func ParseTunnels(s string) ([]Tunnel, error) {
+	var out []Tunnel
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, spec, ok := strings.Cut(part, "=")
+		if !ok {
+			return nil, fmt.Errorf("tunnel %q: use name=local:host:port", part)
+		}
+		f := strings.Split(spec, ":")
+		var t Tunnel
+		t.Name = strings.TrimSpace(name)
+		if len(f) == 4 {
+			t.Bind, f = f[0], f[1:]
+		}
+		if len(f) != 3 {
+			return nil, fmt.Errorf("tunnel %q: use name=local:host:port", part)
+		}
+		var err1, err2 error
+		t.Local, err1 = strconv.Atoi(f[0])
+		t.RemoteHost = f[1]
+		t.RemotePort, err2 = strconv.Atoi(f[2])
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("tunnel %q: ports must be numbers", part)
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
 // KeyPathExpanded resolves a leading ~/.
 func (c Connection) KeyPathExpanded() string {
 	if strings.HasPrefix(c.KeyPath, "~/") {
@@ -351,8 +409,46 @@ func LoadFile(path string) (*Store, error) {
 	return &s, nil
 }
 
-// Save writes connections.json atomically with mode 0600.
+// Save writes connections.json atomically with mode 0600. It overwrites the file with this store; writers
+// that may race with another process (the TUI and the MCP tool new_connection) use Update instead.
 func (s *Store) Save() error { return s.SaveFile(ConnectionsFile()) }
+
+// Update is the read-modify-write for connections.json: under an exclusive lock on connections.json.lock it
+// loads the current file, applies fn and saves the result atomically (when fn returns no error). The TUI and
+// the MCP processes both write through Update, so no process overwrites an entry another one just added.
+// An invalid file is never overwritten.
+func Update(fn func(*Store) error) (*Store, error) {
+	path := ConnectionsFile()
+	if err := EnsureDir(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	unlock, err := lockFile(path + ".lock")
+	if err != nil {
+		return nil, fmt.Errorf("lock %s: %w", filepath.Base(path), err)
+	}
+	defer unlock()
+	s, err := LoadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := fn(s); err != nil {
+		return nil, err
+	}
+	if err := s.SaveFile(path); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// FileStamp identifies the current version of connections.json (zero if missing); the TUI reloads when
+// it changes.
+func FileStamp() string {
+	st, err := os.Stat(ConnectionsFile())
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d/%d", st.ModTime().UnixNano(), st.Size())
+}
 
 // SaveFile writes the store to path.
 func (s *Store) SaveFile(path string) error {
@@ -501,8 +597,7 @@ func (s Settings) ApprovalTimeout() time.Duration {
 // --- Last used -----------------------------------------------------------------
 
 // The last use of a connection (interactive session or agent command) is kept in the state dir, one empty
-// file per connection id whose mtime is the time of use. connections.json stays owned by the TUI: the MCP
-// processes never write it, so there is no read-modify-write race between processes.
+// file per connection id whose mtime is the time of use, so agent runs never rewrite connections.json.
 
 func usedDir() string { return filepath.Join(StateDir(), "used") }
 

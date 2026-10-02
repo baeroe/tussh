@@ -165,6 +165,9 @@ func (m *Model) hints() string {
 		if len(m.pending) > 0 {
 			return keyHints("y", "approve", "m", "remember", "n", "deny", "?", "help")
 		}
+		if len(m.needsSetup()) > 0 {
+			return keyHints("e", "set up new connection", "?", "help", "q", "quit")
+		}
 		return keyHints("tab", "next view", "?", "help", "q", "quit")
 	case TabHistory:
 		return keyHints("c", "connection", "d", "decision", "/", "search", "?", "help")

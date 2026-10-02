@@ -118,50 +118,10 @@ func newForm(c *config.Connection, home, sshDir string) *connForm {
 	return f
 }
 
-func formatTunnels(ts []config.Tunnel) string {
-	var parts []string
-	for _, t := range ts {
-		s := fmt.Sprintf("%s=%d:%s:%d", t.Name, t.Local, t.RemoteHost, t.RemotePort)
-		if t.Bind != "" && t.Bind != "127.0.0.1" {
-			s = fmt.Sprintf("%s=%s:%d:%s:%d", t.Name, t.Bind, t.Local, t.RemoteHost, t.RemotePort)
-		}
-		parts = append(parts, s)
-	}
-	return strings.Join(parts, ", ")
-}
+// formatTunnels and parseTunnels use the syntax shared with the MCP tool new_connection.
+func formatTunnels(ts []config.Tunnel) string { return config.FormatTunnels(ts) }
 
-// parseTunnels parses "name=[bind:]local:host:port, ...".
-func parseTunnels(s string) ([]config.Tunnel, error) {
-	var out []config.Tunnel
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		name, spec, ok := strings.Cut(part, "=")
-		if !ok {
-			return nil, fmt.Errorf("tunnel %q: use name=local:host:port", part)
-		}
-		f := strings.Split(spec, ":")
-		var t config.Tunnel
-		t.Name = strings.TrimSpace(name)
-		if len(f) == 4 {
-			t.Bind, f = f[0], f[1:]
-		}
-		if len(f) != 3 {
-			return nil, fmt.Errorf("tunnel %q: use name=local:host:port", part)
-		}
-		var err1, err2 error
-		t.Local, err1 = strconv.Atoi(f[0])
-		t.RemoteHost = f[1]
-		t.RemotePort, err2 = strconv.Atoi(f[2])
-		if err1 != nil || err2 != nil {
-			return nil, fmt.Errorf("tunnel %q: ports must be numbers", part)
-		}
-		out = append(out, t)
-	}
-	return out, nil
-}
+func parseTunnels(s string) ([]config.Tunnel, error) { return config.ParseTunnels(s) }
 
 func (f *connForm) visible(i int) bool {
 	switch i {
@@ -467,12 +427,9 @@ func (m *Model) saveForm() {
 		_ = kr.Delete(secrets.Account(c.ID, secrets.KindPassword))
 		c.HasPassword = false
 	}
-	if _, err := m.store.Upsert(c); err != nil {
+	c.NeedsSetup = false // saved by the user: an agent-created connection is set up now
+	if err := m.mutateStore(func(s *config.Store) error { _, err := s.Upsert(c); return err }); err != nil {
 		f.err = err.Error()
-		return
-	}
-	if err := m.store.Save(); err != nil {
-		f.err = "save: " + err.Error()
 		return
 	}
 	m.form = nil

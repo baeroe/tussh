@@ -197,16 +197,33 @@ func (m *Model) connectionsKey(key string) (tea.Model, tea.Cmd) {
 
 // saveConnection upserts and saves c, keeping it selected.
 func (m *Model) saveConnection(c config.Connection) bool {
-	if _, err := m.store.Upsert(c); err != nil {
+	err := m.mutateStore(func(s *config.Store) error {
+		cur, ok := s.ByID(c.ID)
+		if !ok {
+			return fmt.Errorf("%s was removed in the meantime", c.Name)
+		}
+		// only the fields the list keys change; anything else stays as another writer left it
+		cur.AccessLevel, cur.Favorite = c.AccessLevel, c.Favorite
+		_, err := s.Upsert(cur)
+		return err
+	})
+	if err != nil {
 		m.flashErr("%v", err)
-		return false
-	}
-	if err := m.store.Save(); err != nil {
-		m.flashErr("save failed: %v", err)
 		return false
 	}
 	m.rebuildRows(c.ID)
 	return true
+}
+
+// mutateStore applies fn to the current connections.json under the file lock (config.Update) and adopts
+// the result, so changes another process made in the meantime (an agent's new_connection) are kept.
+func (m *Model) mutateStore(fn func(*config.Store) error) error {
+	s, err := config.Update(fn)
+	if err != nil {
+		return err
+	}
+	m.adoptStore(s)
+	return nil
 }
 
 // detailCount is the number of selectable items in the detail pane (tunnels, then remembered commands).
@@ -288,8 +305,7 @@ func (m *Model) deleteConnection(c config.Connection) {
 	}
 	_ = m.opts.Keyring.Delete(secrets.Account(c.ID, secrets.KindPassword))
 	_ = m.opts.Keyring.Delete(secrets.Account(c.ID, secrets.KindPassphrase))
-	m.store.Delete(c.ID)
-	if err := m.store.Save(); err != nil {
+	if err := m.mutateStore(func(s *config.Store) error { s.Delete(c.ID); return nil }); err != nil {
 		m.flashErr("save failed: %v", err)
 		return
 	}
@@ -354,6 +370,7 @@ func (m *Model) importKey(key string) (tea.Model, tea.Cmd) {
 	case "enter":
 		n := 0
 		var errs []string
+		var add []config.Connection
 		for i, h := range v.hosts {
 			if !v.selected[i] {
 				continue
@@ -369,14 +386,20 @@ func (m *Model) importKey(key string) (tea.Model, tea.Cmd) {
 			if c.Port == 22 {
 				c.Port = 0
 			}
-			if _, err := m.store.Upsert(c); err != nil {
-				errs = append(errs, r.Alias+": "+err.Error())
-				continue
-			}
-			n++
+			add = append(add, c)
 		}
-		if n > 0 {
-			if err := m.store.Save(); err != nil {
+		if len(add) > 0 {
+			err := m.mutateStore(func(s *config.Store) error {
+				for _, c := range add {
+					if _, err := s.Upsert(c); err != nil {
+						errs = append(errs, c.Name+": "+err.Error())
+						continue
+					}
+					n++
+				}
+				return nil
+			})
+			if err != nil {
 				m.flashErr("save failed: %v", err)
 				return m, nil
 			}
@@ -436,14 +459,28 @@ func (m *Model) listLines(iw, h int, focused bool) []string {
 			fav = warnStyle.Render("★")
 		}
 		name := fit(c.Name, nameW)
+		setupOnly := c.NeedsSetup && !showTarget // the badge takes the level column (the level is none anyway)
+		if setupOnly {
+			bw := min(width(setupBadge), nameW)
+			name = fit(c.Name, nameW+13-bw-1)
+		}
 		if i == m.cursor[TabConnections] {
 			name = boldStyle.Render(name)
 		}
 		row := " " + fav + " " + m.reachDot(c.ID) + " " + name + " "
-		if showTarget {
-			row += dimStyle.Render(fit(c.Target(), iw-width(row)-13)) + " "
+		if setupOnly {
+			row += warnStyle.Render(fit(setupBadge, min(width(setupBadge), nameW)))
+		} else if showTarget {
+			tw := iw - width(row) - 13
+			if c.NeedsSetup {
+				row += warnStyle.Render(fit(setupBadge, tw)) + " "
+			} else {
+				row += dimStyle.Render(fit(c.Target(), tw)) + " "
+			}
 		}
-		row += badge(c.Level(), false)
+		if !setupOnly {
+			row += badge(c.Level(), false)
+		}
 		if i == m.cursor[TabConnections] {
 			cursorLine = len(lines)
 			if focused {
@@ -555,6 +592,21 @@ func (m *Model) detailLines(c config.Connection, dw int) []string {
 		head += "  " + warnStyle.Render("★ favorite")
 	}
 	l = append(l, head, "")
+	if c.CreatedBy == config.CreatedByAgent {
+		when := ""
+		if !c.CreatedAt.IsZero() {
+			when = " at " + c.CreatedAt.Local().Format("2006-01-02 15:04")
+		}
+		l = append(l, kv("Created", "by "+agentName(c)+dimStyle.Render(when), lw))
+	}
+	if c.NeedsSetup {
+		for _, s := range wrap("New · needs setup: press e to choose the authentication (key or password) and an agent access level, then save.", dw) {
+			l = append(l, warnStyle.Render(s))
+		}
+		l = append(l, "")
+	} else if c.CreatedBy == config.CreatedByAgent {
+		l = append(l, "")
+	}
 	auth := "key"
 	switch {
 	case c.Auth == config.AuthPassword:
@@ -713,4 +765,18 @@ func clockShort(t time.Time) string {
 		return t.Format("15:04")
 	}
 	return t.Format("Mon 15:04")
+}
+
+// setupBadge marks connections an agent created that the user has not set up yet.
+const setupBadge = "new · needs setup"
+
+// needsSetup lists the agent-created connections that still need setup.
+func (m *Model) needsSetup() []config.Connection {
+	var out []config.Connection
+	for _, c := range m.store.Connections {
+		if c.NeedsSetup {
+			out = append(out, c)
+		}
+	}
+	return out
 }

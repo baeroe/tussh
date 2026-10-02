@@ -20,6 +20,7 @@ const (
 	Denied   = "denied"
 	Timeout  = "timeout"
 	Blocked  = "blocked" // policy deny (level none, unknown connection, invalid input)
+	Created  = "created" // new_connection added a connection (it needs setup by the user)
 )
 
 // Entry is one audit record. Command output is kept bounded (OutputCap bytes per stream, head and tail)

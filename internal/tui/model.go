@@ -110,13 +110,15 @@ type reachInfo struct {
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	opts    Options
-	tab     Tab
-	width   int
-	height  int
-	store   *config.Store
-	loadErr error
-	rules   *classify.Classifier
+	opts       Options
+	tab        Tab
+	width      int
+	height     int
+	store      *config.Store
+	storeStamp string          // config.FileStamp of the loaded connections.json
+	known      map[string]bool // connection ids seen so far (to announce ones an agent created)
+	loadErr    error
+	rules      *classify.Classifier
 
 	cursor [numTabs]int
 
@@ -240,17 +242,70 @@ func tick() tea.Cmd {
 }
 
 func (m *Model) reload() {
+	m.storeStamp = config.FileStamp()
 	s, err := config.Load()
 	m.loadErr = err
 	if err != nil {
 		s = &config.Store{Version: 1}
 	}
 	m.store = s
+	m.known = map[string]bool{}
+	for _, c := range s.Connections {
+		m.known[c.ID] = true
+	}
 	m.rules = classify.LoadRules(config.RulesFile())
 	m.used = config.LastUsed()
 	m.allows = allow.List()
 	m.refreshTunnels()
 	m.rebuildRows("")
+}
+
+// adoptStore takes over a store this process just wrote.
+func (m *Model) adoptStore(s *config.Store) {
+	m.store, m.loadErr, m.storeStamp = s, nil, config.FileStamp()
+	for _, c := range s.Connections {
+		m.known[c.ID] = true
+	}
+}
+
+// refreshStore reloads connections.json when another process changed it (an agent's new_connection) and
+// announces connections an agent created. An open form keeps its own copy, so unsaved edits are not touched.
+func (m *Model) refreshStore() {
+	stamp := config.FileStamp()
+	if stamp == m.storeStamp {
+		return
+	}
+	s, err := config.Load()
+	if err != nil {
+		m.storeStamp, m.loadErr = stamp, err
+		return
+	}
+	m.store, m.loadErr, m.storeStamp = s, nil, stamp
+	var fresh []config.Connection
+	for _, c := range s.Connections {
+		if !m.known[c.ID] {
+			m.known[c.ID] = true
+			if c.CreatedBy == config.CreatedByAgent && c.NeedsSetup {
+				fresh = append(fresh, c)
+			}
+		}
+	}
+	m.refreshTunnels()
+	m.rebuildRows(m.selectedID())
+	switch {
+	case len(fresh) == 1:
+		m.flash("%s added %s · needs setup (e)", agentName(fresh[0]), fresh[0].Name)
+	case len(fresh) > 1:
+		m.flash("agents created %d connections · they need setup (e)", len(fresh))
+	}
+}
+
+// agentName is who created an agent-made connection.
+func agentName(c config.Connection) string {
+	if c.CreatedAgent != "" {
+		return oneLine(c.CreatedAgent)
+	}
+	return "an agent"
 }
 
 func (m *Model) refreshTunnels() {
@@ -423,6 +478,7 @@ func (m *Model) onTick(now time.Time) (tea.Model, tea.Cmd) {
 		return m.quit()
 	}
 	m.refreshHistory()
+	m.refreshStore()
 	var cmds []tea.Cmd
 	if m.ticks%4 == 0 { // every 2 s
 		m.refreshTunnels()

@@ -261,7 +261,7 @@ func TestMCPHandshakeAndList(t *testing.T) {
 	for _, tool := range r["result"].(map[string]any)["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if strings.Join(names, ",") != "list_connections,run_command" {
+	if strings.Join(names, ",") != "list_connections,run_command,new_connection" {
 		t.Fatalf("tools: %v", names)
 	}
 	isErr, text, sc := c.call("list_connections", map[string]any{})
@@ -504,5 +504,156 @@ func TestMCPRememberedCommand(t *testing.T) {
 	}
 	if isErr, text, _ := c.call("list_connections", map[string]any{}); isErr || strings.Contains(text, `"group"`) {
 		t.Fatalf("list: %s", text)
+	}
+}
+
+func TestMCPNewConnection(t *testing.T) {
+	sb := newSandbox(t)
+	sb.addConnections(t, connRO, connNone)
+	c := startMCP(t, sb.env)
+	c.init()
+
+	// the schema has no access level, auth, key or secret fields and allows nothing else
+	r := c.request("tools/list", map[string]any{})
+	var schema map[string]any
+	for _, tool := range r["result"].(map[string]any)["tools"].([]any) {
+		if tm := tool.(map[string]any); tm["name"] == "new_connection" {
+			schema = tm["inputSchema"].(map[string]any)
+		}
+	}
+	if schema == nil || schema["additionalProperties"] != false {
+		t.Fatalf("schema: %v", schema)
+	}
+	var props []string
+	for k := range schema["properties"].(map[string]any) {
+		props = append(props, k)
+	}
+	for _, bad := range []string{"access_level", "auth", "key_path", "password", "passphrase"} {
+		if _, ok := schema["properties"].(map[string]any)[bad]; ok {
+			t.Fatalf("schema offers %s: %v", bad, props)
+		}
+	}
+
+	// smuggled fields are rejected, nothing is written, and secret values never reach the log
+	for _, args := range []map[string]any{
+		{"name": "x1", "host": "h.example", "access_level": "trusted"},
+		{"name": "x2", "host": "h.example", "password": "hunter2-secret"},
+		{"name": "x3", "host": "h.example", "passphrase": "pp-secret"},
+		{"name": "x4", "host": "h.example", "key_path": "~/.ssh/id_ed25519"},
+		{"name": "x5", "host": "h.example", "auth": "password"},
+		{"name": "x6", "host": "h.example", "favourite": true},
+	} {
+		isErr, text, _ := c.call("new_connection", args)
+		if !isErr || !strings.Contains(text, "rejected") {
+			t.Fatalf("%v: %v %s", args, isErr, text)
+		}
+	}
+	for _, args := range []map[string]any{
+		{"host": "h.example"},
+		{"name": "bad name", "host": "h.example"},
+		{"name": "t1", "host": "h.example", "tunnels": []string{"db=3307:127.0.0.1"}},
+		{"name": "t2", "host": "h.example", "tunnels": []string{"db=99999:127.0.0.1:3306"}},
+		{"name": "t3", "host": "-oProxyCommand=x"},
+		{"name": "RO", "host": "h.example"}, // duplicate (case-insensitive)
+		{"name": "secret-box", "host": "h.example"},
+	} {
+		if isErr, text, _ := c.call("new_connection", args); !isErr {
+			t.Fatalf("%v accepted: %s", args, text)
+		}
+	}
+	if isErr, text, _ := c.call("new_connection", map[string]any{"name": "ro", "host": "h.example"}); !isErr || !strings.Contains(text, "already exists") {
+		t.Fatalf("duplicate: %s", text)
+	}
+	s, _ := config.Load()
+	if len(s.Connections) != 2 {
+		t.Fatalf("rejected calls wrote connections: %d", len(s.Connections))
+	}
+
+	isErr, text, sc := c.call("new_connection", map[string]any{"name": "shop-staging", "host": "10.1.2.3", "port": 2222, "user": "deploy",
+		"description": "staging shop", "tags": []string{"staging", "shop"}, "tunnels": []string{"mysql=3307:127.0.0.1:3306"}})
+	if isErr || sc["usable"] != false || sc["needs_setup"] != true || sc["access_level"] != "none" || !strings.Contains(text, "NOT usable") {
+		t.Fatalf("create: %v %s", isErr, text)
+	}
+	s, _ = config.Load()
+	got, ok := s.ByName("shop-staging")
+	if !ok || got.Level() != config.LevelNone || !got.NeedsSetup || got.CreatedBy != "agent" || got.CreatedAgent != "test-harness 1.0" ||
+		got.CreatedAt.IsZero() || got.Port != 2222 || got.User != "deploy" || len(got.Tunnels) != 1 || got.HasPassword || got.HasPassphrase || got.KeyPath != "" {
+		t.Fatalf("stored: %+v", got)
+	}
+	// invisible to agents until the user sets it up
+	_, text, _ = c.call("list_connections", map[string]any{})
+	if strings.Contains(text, "shop-staging") {
+		t.Fatal("new connection is listed")
+	}
+	if isErr, text, _ := c.call("run_command", map[string]any{"connection": "shop-staging", "command": "uptime"}); !isErr || !strings.Contains(text, "unknown connection") {
+		t.Fatalf("usable: %s", text)
+	}
+
+	entries, _ := audit.Read(0)
+	created, blocked := 0, 0
+	for _, e := range entries {
+		raw, _ := json.Marshal(e)
+		if strings.Contains(string(raw), "hunter2") || strings.Contains(string(raw), "pp-secret") {
+			t.Fatalf("secret in audit log: %s", raw)
+		}
+		switch {
+		case e.Decision == audit.Created && e.Connection == "shop-staging":
+			created++
+			if !strings.Contains(e.Command, "host=10.1.2.3") || e.Agent != "test-harness 1.0" {
+				t.Fatalf("audit: %+v", e)
+			}
+		case e.Decision == audit.Blocked && strings.HasPrefix(e.Command, "new_connection"):
+			blocked++
+		}
+	}
+	if created != 1 || blocked != 14 {
+		t.Fatalf("audit: %d created, %d blocked", created, blocked)
+	}
+}
+
+// TestMCPNewConnectionConcurrentWrites: agent calls (in the MCP subprocess) and TUI-style writes (config.Update in
+// this process) run at the same time; no entry is lost.
+func TestMCPNewConnectionConcurrentWrites(t *testing.T) {
+	sb := newSandbox(t)
+	sb.addConnections(t, connRO)
+	c := startMCP(t, sb.env)
+	c.init()
+	var wg sync.WaitGroup
+	errs := make(chan string, 40)
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			if isErr, text, _ := c.call("new_connection", map[string]any{"name": fmt.Sprintf("agent-%d", i), "host": "a.example"}); isErr {
+				errs <- text
+			}
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			_, err := config.Update(func(s *config.Store) error {
+				ro, _ := s.ByName("ro")
+				ro.Favorite = !ro.Favorite
+				if _, err := s.Upsert(ro); err != nil {
+					return err
+				}
+				_, err := s.Upsert(config.Connection{Name: fmt.Sprintf("user-%d", i), Host: "u.example", Auth: config.AuthKey, AccessLevel: config.LevelNone})
+				return err
+			})
+			if err != nil {
+				errs <- err.Error()
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+	s, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Connections) != 21 {
+		t.Fatalf("expected 21 connections, got %d", len(s.Connections))
 	}
 }

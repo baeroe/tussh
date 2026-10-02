@@ -183,3 +183,54 @@ func TestRememberTTL(t *testing.T) {
 		t.Fatal("ttl")
 	}
 }
+
+func TestUpdateConcurrentAndFailClosed(t *testing.T) {
+	t.Setenv("TUSSH_CONFIG_DIR", t.TempDir())
+	done := make(chan error, 30)
+	for i := 0; i < 30; i++ {
+		go func(i int) {
+			_, err := Update(func(s *Store) error {
+				c := valid()
+				c.Name = "c" + strings.Repeat("x", i%5) + string(rune('a'+i%26)) + string(rune('0'+i/26))
+				_, err := s.Upsert(c)
+				return err
+			})
+			done <- err
+		}(i)
+	}
+	for i := 0; i < 30; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := Load()
+	if err != nil || len(s.Connections) != 30 {
+		t.Fatalf("lost updates: %d %v", len(s.Connections), err)
+	}
+	// an invalid file is never overwritten
+	os.WriteFile(ConnectionsFile(), []byte("{broken"), 0o600)
+	if _, err := Update(func(s *Store) error { return nil }); err == nil {
+		t.Fatal("update on an invalid file")
+	}
+	if b, _ := os.ReadFile(ConnectionsFile()); string(b) != "{broken" {
+		t.Fatal("invalid file overwritten")
+	}
+}
+
+func TestParseTunnelsAndAgentFields(t *testing.T) {
+	ts, err := ParseTunnels("db=3307:127.0.0.1:3306, web=0.0.0.0:8080:localhost:80")
+	if err != nil || FormatTunnels(ts) != "db=3307:127.0.0.1:3306, web=0.0.0.0:8080:localhost:80" {
+		t.Fatal(ts, err)
+	}
+	c := valid()
+	c.CreatedBy, c.NeedsSetup = CreatedByAgent, true
+	s := &Store{Connections: []Connection{c}}
+	p := t.TempDir() + "/c.json"
+	if err := s.SaveFile(p); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), `"needs_setup": true`) || !strings.Contains(string(b), `"created_by": "agent"`) || strings.Contains(string(b), "created_at") {
+		t.Fatalf("%s", b)
+	}
+}

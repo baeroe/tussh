@@ -85,3 +85,16 @@ func run(timeout time.Duration, name string, args ...string) {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	_ = cmd.Run()
 }
+
+// NewConnection notifies about a connection an agent created (it needs setup in tussh).
+func NewConnection(opts Options, agent, connection string) {
+	if agent == "" {
+		agent = "An agent"
+	}
+	if opts.Notification && runtime.GOOS == "darwin" {
+		macNotification("tussh: new connection needs setup", short(agent, 60)+" created "+short(connection, 64)+". Open tussh to set auth and access level.")
+	}
+	if opts.Herdr {
+		InvokeHerdr()
+	}
+}
