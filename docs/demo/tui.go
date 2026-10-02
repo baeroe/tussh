@@ -4,7 +4,7 @@
 // the reachability probe is simulated, because the demo hosts (*.example) do not exist. Every other part
 // (connections, approvals, history, forms, Setup) reads the sandbox files exactly like `tussh` does.
 //
-//	go build -o tussh-demo docs/demo/tui.go && ./tussh-demo [alerts]
+//	go build -o tussh-demo docs/demo/tui.go && ./tussh-demo [alerts [--popup]]
 package main
 
 import (
@@ -40,6 +40,7 @@ func main() {
 	opts := tui.Options{Tab: tui.TabConnections, Probe: probe, Bin: filepath.Join(home, ".local", "bin", "tussh")}
 	if len(os.Args) > 1 && os.Args[1] == "alerts" {
 		opts.Tab = tui.TabAlerts
+		opts.ExitWhenDone = len(os.Args) > 2 && os.Args[2] == "--popup"
 	}
 	_, err := tea.NewProgram(tui.New(opts), tea.WithAltScreen()).Run()
 	approval.ClearHeartbeat()
