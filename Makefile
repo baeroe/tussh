@@ -4,7 +4,7 @@ VERSION ?= 0.1.0
 GO ?= go
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test test-unit vet fmt install clean
+.PHONY: build test test-unit vet fmt install clean screenshots
 
 build:
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/tussh .
@@ -31,3 +31,7 @@ install:
 
 clean:
 	rm -rf bin
+
+# README screenshots (docs/screenshots) from the VHS tapes in docs/tapes, with demo data in a sandbox
+screenshots:
+	bash docs/screenshots.sh
