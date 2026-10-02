@@ -158,7 +158,7 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 			if s.Notify != nil {
 				s.Notify(*r)
 			} else {
-				notify.NewRequest(notify.Options{Notification: !settings.DisableNotifications, Herdr: !settings.DisableHerdr}, conn.Name, req.Command)
+				notify.NewRequest(notify.Options{Notification: !settings.DisableNotifications}, conn.Name, req.Command)
 			}
 		}
 		d, err := s.Queue.Wait(r.ID, timeout, s.Poll, ctx.Done())
@@ -401,7 +401,7 @@ func (s *Service) NewConnection(raw json.RawMessage) (*NewConnResponse, error) {
 			s.NotifyNewConn(s.Agent, c.Name)
 		} else {
 			st := config.LoadSettings()
-			notify.NewConnection(notify.Options{Notification: !st.DisableNotifications, Herdr: !st.DisableHerdr}, s.Agent, c.Name)
+			notify.NewConnection(notify.Options{Notification: !st.DisableNotifications}, s.Agent, c.Name)
 		}
 	}
 	return &NewConnResponse{

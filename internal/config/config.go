@@ -539,7 +539,6 @@ func NewID() string {
 type Settings struct {
 	ApprovalTimeoutSeconds int  `json:"approval_timeout_seconds,omitempty"`
 	DisableNotifications   bool `json:"disable_notifications,omitempty"`
-	DisableHerdr           bool `json:"disable_herdr,omitempty"`
 	// RememberTTLHours is how long "approve & remember" allows a command (default 8, max 168).
 	RememberTTLHours int `json:"remember_ttl_hours,omitempty"`
 	// DisableAuditOutput stops tussh from keeping the (bounded) command output in the audit log.
@@ -578,7 +577,6 @@ func LoadSettings() Settings {
 	}
 	if os.Getenv("TUSSH_NO_NOTIFY") == "1" {
 		s.DisableNotifications = true
-		s.DisableHerdr = true
 	}
 	return s
 }

@@ -10,13 +10,3 @@ func TestAppleScriptString(t *testing.T) {
 		t.Fatal(short("a\n  b", 10))
 	}
 }
-
-func TestHerdrBinMissing(t *testing.T) {
-	t.Setenv("HERDR_BIN_PATH", "/nonexistent/herdr")
-	t.Setenv("PATH", "/nonexistent")
-	t.Setenv("HOME", t.TempDir())
-	if HerdrBin() != "" {
-		t.Fatal("expected no herdr")
-	}
-	InvokeHerdr() // must not fail or block
-}

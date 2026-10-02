@@ -286,7 +286,7 @@ func (m *Model) alertsView(w, h int) string {
 	if len(m.pending) == 0 {
 		lines := []string{"", dimStyle.Render(" No pending approval requests."), "",
 			dimStyle.Render(" Requests from agents appear here (and as a popup in the other tabs)."),
-			dimStyle.Render(" Without an open tussh you get a notification and, in herdr, a popup.")}
+			dimStyle.Render(" Without an open tussh you get a macOS notification.")}
 		if ns := m.needsSetup(); len(ns) > 0 {
 			lines = append(lines, "", warnStyle.Bold(true).Render(fmt.Sprintf(" New connections from agents (%d) need setup", len(ns))))
 			for _, c := range ns {

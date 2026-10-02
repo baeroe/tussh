@@ -5,7 +5,7 @@ A terminal SSH connection manager for **you** and an MCP server for your **AI ag
 - **You** run `tussh` in any terminal. You can add, edit and delete SSH connections (password or key), press **Enter** to open an interactive session, start and stop port forwards, approve or deny agent requests, and read the audit history.
 - **Agents** connect through `tussh mcp` (stdio). They only see the connections you shared with them. Each command is run automatically, sent to you for approval, or refused, depending on the connection's **access level** and on the **sensitive command rules**.
 
-tussh is a single Go binary and needs nothing else at runtime. It works without [herdr](https://herdr.dev). If you use herdr, [herdr-tussh](https://github.com/baeroe/herdr-tussh) adds key bindings, and an approval popup appears when an agent is waiting for you.
+tussh is a single Go binary and needs nothing else at runtime. It works without [herdr](https://herdr.dev). If you use herdr, [herdr-tussh](https://github.com/baeroe/herdr-tussh) adds key bindings to open it.
 
 ## Why
 
@@ -83,17 +83,17 @@ If the file is invalid (broken JSON, an unknown field or a bad regex), **every**
 1. An agent calls `run_command`. tussh classifies the command and applies the access level.
 2. If the command needs approval, tussh writes a request to `~/.local/state/tussh/approvals/` (files with mode 0600 and atomic writes), and the MCP call **blocks**.
 3. The TUI's **Alerts** tab shows each pending request as a card: the connection and its access level, the requesting agent (MCP `clientInfo`), the command, why it needs approval, the agent's optional justification, and a countdown bar until it is denied automatically. When a new request arrives while the TUI is open, the same card pops up over the current view. Keys: **y** approve, **m** approve & remember (see below), **n** deny (you can type a note for the agent, **Enter** sends it, **Esc** cancels), **Esc** later.
-4. If no TUI is open, tussh sends a macOS notification (`osascript`). If herdr is available (`$HERDR_BIN_PATH`, `herdr` on PATH or `~/.local/bin/herdr`), tussh also invokes the `herdr-tussh.alerts` action, which opens `tussh alerts` as a popup inside herdr. Both fail silently.
+4. If no TUI is open, tussh sends a macOS notification (`osascript`). It fails silently.
 5. Without a decision within **120 s**, the request is denied automatically, and the agent gets a clear message. You can change the timeout with `approval_timeout_seconds` in `~/.config/tussh/settings.json` or the `TUSSH_APPROVAL_TIMEOUT` environment variable.
 
 A deny note is passed to the agent with the denial (`denied by the user: <note>`) and stored in the audit log.
 
-Exactly one decision wins. Decisions are created exclusively with `link(2)`, so a late approval cannot race with the timeout. You can also approve requests from a shell: `tussh pending`, `tussh approve ID`, `tussh deny ID`. `tussh alerts` opens the TUI directly on the Alerts tab. `tussh alerts --popup` also quits once every request it showed is decided (used by the herdr popup).
+Exactly one decision wins. Decisions are created exclusively with `link(2)`, so a late approval cannot race with the timeout. You can also approve requests from a shell: `tussh pending`, `tussh approve ID`, `tussh deny ID`. `tussh alerts` opens the TUI directly on the Alerts tab. `tussh alerts --popup` also quits once every request it showed is decided (handy for a popup window in a terminal multiplexer).
 
 `~/.config/tussh/settings.json` (optional):
 
 ```json
-{ "approval_timeout_seconds": 120, "disable_notifications": false, "disable_herdr": false,
+{ "approval_timeout_seconds": 120, "disable_notifications": false,
   "remember_ttl_hours": 8, "disable_audit_output": false }
 ```
 
@@ -164,7 +164,7 @@ MCP tools:
 
 | `new_connection(name, host, port?, user?, description?, tags?, tunnels?)` | Adds a connection to your list. Agents can set **only** these fields; `tunnels` is a list of `name=[bind:]local:host:port`, validated like the form. The schema has no access level, auth method, key file, password or passphrase, and any other field is rejected (`additionalProperties: false`; tussh also rejects such fields itself and never logs their values). The connection is created with access level `none`, no credentials, `created_by: "agent"` (plus the harness name and version from `clientInfo` and the time) and `needs_setup: true`, so it does not show up in `list_connections` and `run_command` cannot use it. The result tells the agent that it is not usable until you set the authentication and an access level. Names must be unique (case-insensitive); the error for a duplicate also reveals that a hidden connection with that name exists. At most 20 agent-created connections can wait for setup at once. |
 
-You are notified like for approvals: a macOS notification and the herdr popup when no TUI is open, a message in the footer when one is. The list shows such connections with a **new · needs setup** badge, the detail pane shows who created them and when, and the Alerts tab lists them (**e** opens the form for the first one). Saving the connection in the form clears `needs_setup`; **x** deletes it as usual. Every `new_connection` call is in the audit log (`created`, or `blocked` with the reason).
+You are notified like for approvals: a macOS notification when no TUI is open, a message in the footer when one is. The list shows such connections with a **new · needs setup** badge, the detail pane shows who created them and when, and the Alerts tab lists them (**e** opens the form for the first one). Saving the connection in the form clears `needs_setup`; **x** deletes it as usual. Every `new_connection` call is in the audit log (`created`, or `blocked` with the reason).
 
 There is deliberately no tool for interactive sessions or tunnels. A broken `connections.json` exposes nothing (fail closed).
 

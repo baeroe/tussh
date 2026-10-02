@@ -54,7 +54,7 @@ type Options struct {
 	Connect   func(c config.Connection) (*exec.Cmd, func(), error)
 	SSHConfig string // ssh config to import from (default ~/.ssh/config)
 	NoTick    bool   // tests drive ticks manually
-	// ExitWhenDone quits once requests were shown and none are pending any more (herdr alerts popup).
+	// ExitWhenDone quits once requests were shown and none are pending any more (`tussh alerts --popup`).
 	ExitWhenDone bool
 	// Probe checks whether host:port accepts TCP connections (default: dial with a 3 s timeout).
 	Probe func(host string, port int) error
