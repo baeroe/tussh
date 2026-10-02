@@ -5,8 +5,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/baeroe/tussh/internal/config"
 	"github.com/baeroe/tussh/internal/secrets"
@@ -47,10 +49,24 @@ type connForm struct {
 	testGen    int
 	testResult string
 	testOK     bool
+
+	// key file field: detected keys, inline completion, validation hint
+	home       string   // for ~
+	sshDir     string   // where keys are detected
+	keys       []sshKey // private keys in sshDir (scanned when the field is first focused)
+	keysLoaded bool
+	keySel     int // highlighted row in the filtered key list, -1 = none
+	keyOff     int // first visible row of the key list
+	ghost      string
+	check      keyCheck
+	checkFor   string // value+passphrase state the check was computed for
 }
 
-func newForm(c *config.Connection) *connForm {
-	f := &connForm{auth: config.AuthKey, level: config.LevelNone}
+// keyListRows is the maximum number of rows of the detected keys list.
+const keyListRows = 6
+
+func newForm(c *config.Connection, home, sshDir string) *connForm {
+	f := &connForm{auth: config.AuthKey, level: config.LevelNone, home: home, sshDir: sshDir, keySel: -1}
 	for i := range f.inputs {
 		ti := textinput.New()
 		ti.Prompt = ""
@@ -65,7 +81,12 @@ func newForm(c *config.Connection) *connForm {
 	f.inputs[fUser].Placeholder = "remote user (empty: ssh default)"
 	f.inputs[fDescription].Placeholder = "optional, also shown to agents"
 	f.inputs[fTags].Placeholder = "comma-separated, e.g. prod, shop"
-	f.inputs[fKeyPath].Placeholder = "~/.ssh/id_ed25519 (empty: ssh defaults / agent)"
+	f.inputs[fKeyPath].Placeholder = "~/.ssh/id_ed25519"
+	// the ghost completion uses textinput's suggestion rendering; its keys are handled by the form
+	f.inputs[fKeyPath].ShowSuggestions = true
+	f.inputs[fKeyPath].KeyMap.AcceptSuggestion = key.NewBinding(key.WithDisabled())
+	f.inputs[fKeyPath].KeyMap.NextSuggestion = key.NewBinding(key.WithDisabled())
+	f.inputs[fKeyPath].KeyMap.PrevSuggestion = key.NewBinding(key.WithDisabled())
 	f.inputs[fTunnels].Placeholder = "mysql=3307:127.0.0.1:3306, redis=6380:localhost:6379"
 	f.inputs[fPassword].EchoMode = textinput.EchoPassword
 	f.inputs[fPassphrase].EchoMode = textinput.EchoPassword
@@ -162,6 +183,99 @@ func (f *connForm) setFocus(i int) {
 	if !f.isChoice(i) {
 		f.inputs[i].Focus()
 	}
+	f.keySel, f.keyOff = -1, 0
+	if i == fKeyPath && !f.keysLoaded && f.sshDir != "" {
+		f.keys, f.keysLoaded = scanKeys(f.sshDir, f.home), true
+	}
+	f.refreshGhost()
+}
+
+// refreshGhost recomputes the inline completion of the key file field (only with the cursor at the end).
+func (f *connForm) refreshGhost() {
+	in := &f.inputs[fKeyPath]
+	f.ghost = ""
+	if f.focus == fKeyPath && in.Position() == len([]rune(in.Value())) {
+		f.ghost = completePath(in.Value(), f.home)
+	}
+	if f.ghost == "" {
+		in.SetSuggestions(nil)
+	} else {
+		in.SetSuggestions([]string{in.Value() + f.ghost})
+	}
+}
+
+// keyList is the detected keys filtered by the field's value.
+func (f *connForm) keyList() []sshKey {
+	return filterKeys(f.keys, f.inputs[fKeyPath].Value(), f.home)
+}
+
+func (f *connForm) moveKeySel(delta int) {
+	n := len(f.keyList())
+	if n == 0 {
+		f.keySel = -1
+		return
+	}
+	switch {
+	case f.keySel < 0 && delta > 0:
+		f.keySel = 0
+	case f.keySel < 0:
+		f.keySel = n - 1
+	default:
+		f.keySel = (f.keySel + delta + n) % n
+	}
+	if f.keySel < f.keyOff {
+		f.keyOff = f.keySel
+	}
+	if f.keySel >= f.keyOff+keyListRows {
+		f.keyOff = f.keySel - keyListRows + 1
+	}
+}
+
+// setKeyPath replaces the field's value (cursor at the end) and resets the list.
+func (f *connForm) setKeyPath(v string) {
+	f.inputs[fKeyPath].SetValue(v)
+	f.inputs[fKeyPath].CursorEnd()
+	f.keySel, f.keyOff = -1, 0
+	f.refreshGhost()
+}
+
+// keyFieldKey handles the key file field's own keys; ok=false passes the key on.
+func (f *connForm) keyFieldKey(k tea.KeyMsg) (ok bool) {
+	switch k.String() {
+	case "ctrl+n":
+		f.moveKeySel(1)
+		return true
+	case "ctrl+p":
+		f.moveKeySel(-1)
+		return true
+	case "enter":
+		if l := f.keyList(); f.keySel >= 0 && f.keySel < len(l) {
+			f.setKeyPath(l[f.keySel].Display)
+			return true
+		}
+	case "esc":
+		if f.keySel >= 0 {
+			f.keySel = -1
+			return true
+		}
+	case "right", "ctrl+f":
+		in := &f.inputs[fKeyPath]
+		if f.ghost != "" && in.Position() == len([]rune(in.Value())) {
+			f.setKeyPath(in.Value() + f.ghost)
+			return true
+		}
+	}
+	return false
+}
+
+// keyCheck returns the (cached) validation hint of the key file field.
+func (f *connForm) keyCheck() keyCheck {
+	hasPP := f.inputs[fPassphrase].Value() != "" || (f.orig != nil && f.orig.HasPassphrase)
+	id := f.inputs[fKeyPath].Value() + "\x00" + strconv.FormatBool(hasPP)
+	if id != f.checkFor {
+		f.check, f.checkFor = checkKeyFile(f.inputs[fKeyPath].Value(), f.home, hasPP), id
+	}
+	return f.check
 }
 
 func (f *connForm) move(delta int) {
@@ -196,6 +310,9 @@ func (f *connForm) cycle(delta int) {
 
 func (m *Model) formKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	f := m.form
+	if f.focus == fKeyPath && f.keyFieldKey(k) {
+		return m, nil
+	}
 	switch k.String() {
 	case "esc":
 		m.form = nil
@@ -228,7 +345,14 @@ func (m *Model) formKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	var cmd tea.Cmd
+	before := f.inputs[f.focus].Value()
 	f.inputs[f.focus], cmd = f.inputs[f.focus].Update(k)
+	if f.focus == fKeyPath {
+		if f.inputs[fKeyPath].Value() != before {
+			f.keySel, f.keyOff = -1, 0
+		}
+		f.refreshGhost()
+	}
 	return m, cmd
 }
 
@@ -382,7 +506,7 @@ func (m *Model) formBox(w, h int) string {
 	const lw = 16
 	inW := max(iw-2-lw-1, 10)
 	var lines []string
-	focusLine := 0
+	focusLine, focusEnd := 0, 0
 	for i := 0; i < numFields; i++ {
 		if !f.visible(i) {
 			continue
@@ -410,10 +534,23 @@ func (m *Model) formBox(w, h int) string {
 			v = choice(config.Levels, f.level, i == f.focus)
 		default:
 			f.inputs[i].Width = inW - 1
-			v = f.inputs[i].View()
+			v = ansi.Truncate(f.inputs[i].View(), inW, "") // the ghost completion may run past the width
 		}
 		lines = append(lines, mark+label+v)
+		indent := strings.Repeat(" ", lw+2)
 		switch i {
+		case fKeyPath:
+			hint := f.keyCheck().render()
+			if i == f.focus && f.ghost != "" && f.keyCheck().level == checkBad {
+				// still typing: show what → completes to instead of "file not found"
+				hint = dimStyle.Render("→ completes to " + f.inputs[fKeyPath].Value() + f.ghost)
+			}
+			lines = append(lines, indent+ansi.Truncate(hint, inW, "…"))
+			if i == f.focus {
+				for _, l := range f.keyListView(inW) {
+					lines = append(lines, indent+l)
+				}
+			}
 		case fLevel:
 			lines = append(lines, strings.Repeat(" ", lw+2)+badge(f.level, true))
 			for _, s := range wrap(levelExplain(f.level), inW) {
@@ -421,6 +558,9 @@ func (m *Model) formBox(w, h int) string {
 			}
 		case fTunnels:
 			lines = append(lines, strings.Repeat(" ", lw+2)+dimStyle.Render("name=[bind:]local:host:port, comma-separated"))
+		}
+		if i == f.focus {
+			focusEnd = len(lines) - 1
 		}
 	}
 	var foot []string
@@ -441,6 +581,9 @@ func (m *Model) formBox(w, h int) string {
 	room := h - 2 - len(foot)
 	if len(lines) > room && room > 3 {
 		start := max(0, focusLine-room/2)
+		if focusEnd >= start+room { // keep the focused field's hint and list visible
+			start = min(focusEnd-room+1, focusLine)
+		}
 		start = min(start, len(lines)-room)
 		lines = lines[start : start+room]
 	}
@@ -449,4 +592,49 @@ func (m *Model) formBox(w, h int) string {
 		title = "Edit " + f.orig.Name
 	}
 	return modalBox(title, append(lines, foot...), fw, cAccent)
+}
+
+// keyListView renders the detected keys below the key file field (at most keyListRows rows, scrolling).
+func (f *connForm) keyListView(w int) []string {
+	l := f.keyList()
+	if len(l) == 0 {
+		if len(f.keys) == 0 && f.inputs[fKeyPath].Value() == "" {
+			return []string{dimStyle.Render("no private keys found in " + tildeHome(f.sshDir, f.home))}
+		}
+		return nil
+	}
+	head := "detected keys"
+	if len(l) > keyListRows {
+		head += fmt.Sprintf(" %d–%d of %d", f.keyOff+1, min(f.keyOff+keyListRows, len(l)), len(l))
+	}
+	hint := keyHints("ctrl+n/p", "select", "enter", "use")
+	if f.keySel < 0 {
+		hint = keyHints("ctrl+n", "select")
+	}
+	out := []string{dimStyle.Render(head) + "  " + hint}
+	pw, tw := 0, 0
+	for _, k := range l {
+		pw, tw = max(pw, width(k.Display)), max(tw, width(k.Type))
+	}
+	pw = min(pw, max(w*45/100, 12))
+	for i := f.keyOff; i < len(l) && i < f.keyOff+keyListRows; i++ {
+		k := l[i]
+		row := ellipsizeMiddle(k.Display, pw)
+		row = fit(row, pw) + "  " + fit(k.Type, tw+2)
+		if k.Comment != "" {
+			row += dimStyle.Render(k.Comment)
+		}
+		if k.Encrypted {
+			if k.Comment != "" {
+				row += "  "
+			}
+			row += warnStyle.Render("passphrase")
+		}
+		if i == f.keySel {
+			out = append(out, highlightRow(selStyle.Render("› ")+row, w))
+		} else {
+			out = append(out, "  "+row)
+		}
+	}
+	return out
 }

@@ -84,6 +84,14 @@ func (h *harnessT) key(keys ...string) {
 			msg = tea.KeyMsg{Type: tea.KeyDown}
 		case "right":
 			msg = tea.KeyMsg{Type: tea.KeyRight}
+		case "left":
+			msg = tea.KeyMsg{Type: tea.KeyLeft}
+		case "ctrl+n":
+			msg = tea.KeyMsg{Type: tea.KeyCtrlN}
+		case "ctrl+p":
+			msg = tea.KeyMsg{Type: tea.KeyCtrlP}
+		case "ctrl+f":
+			msg = tea.KeyMsg{Type: tea.KeyCtrlF}
 		case "space":
 			msg = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")}
 		default:

@@ -141,6 +141,10 @@ func (m *Model) hints() string {
 		return keyHints("enter", "deny with note", "esc", "cancel")
 	case m.modal != nil:
 		return keyHints("y", "approve", "m", "remember", "n", "deny", "esc", "later")
+	case m.form != nil && m.form.focus == fKeyPath && m.form.keySel >= 0:
+		return keyHints("enter", "use key", "ctrl+n/p", "move", "esc", "back", "ctrl+s", "save")
+	case m.form != nil && m.form.focus == fKeyPath:
+		return keyHints("ctrl+n/p", "pick key", "→", "complete", "tab", "next field", "ctrl+s", "save")
 	case m.form != nil:
 		return keyHints("tab", "next field", "ctrl+s", "save", "ctrl+t", "test", "esc", "cancel")
 	case m.imp != nil:
@@ -154,7 +158,7 @@ func (m *Model) hints() string {
 	}
 	switch m.tab {
 	case TabConnections:
-		return keyHints("enter", "connect", "n", "new", "/", "search", "?", "help")
+		return keyHints("enter", "connect", "e", "edit", "n", "new", "/", "search", "?", "help")
 	case TabTunnels:
 		return keyHints("enter", "start/stop", "?", "help", "q", "quit")
 	case TabAlerts:
@@ -199,7 +203,7 @@ func (m *Model) helpBox(w, h int) string {
 		{"Connections", []string{"enter", "connect (interactive ssh)", "n / e / x", "new / edit / delete", "f", "favorite (pin to the top)", "l", "cycle agent access level", "/", "search (name, host, tags …)", "r", "check reachability now", "t", "tunnels (enter starts/stops)", "R", "remembered commands (revoke)", "i", "import from ~/.ssh/config"}},
 		{"Alerts", []string{"y", "approve", "m", "approve & remember this command", "n", "deny, with an optional note"}},
 		{"History", []string{"c", "filter by connection", "d", "filter by decision", "/", "search commands", "esc", "clear filters"}},
-		{"Form", []string{"tab / ↑↓", "next / previous field", "←→", "change a choice", "ctrl+t", "test the connection", "ctrl+s", "save", "esc", "cancel"}},
+		{"Form", []string{"tab / ↑↓", "next / previous field", "←→", "change a choice", "ctrl+n ctrl+p", "key file: pick a detected key", "enter", "key file: use the picked key", "→ / ctrl+f", "key file: accept the completion", "ctrl+t", "test the connection", "ctrl+s", "save", "esc", "cancel"}},
 	}
 	var cols [][]string
 	for _, s := range sections {

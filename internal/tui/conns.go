@@ -125,10 +125,10 @@ func (m *Model) connectionsKey(key string) (tea.Model, tea.Cmd) {
 	}
 	switch key {
 	case "n", "a":
-		m.form = newForm(nil)
+		m.form = newForm(nil, m.opts.Home, m.opts.SSHDir)
 	case "e":
 		if c, ok := m.selectedConnection(); ok {
-			m.form = newForm(&c)
+			m.form = newForm(&c, m.opts.Home, m.opts.SSHDir)
 		}
 	case "x", "delete", "D":
 		if c, ok := m.selectedConnection(); ok {

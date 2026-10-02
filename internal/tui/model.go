@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -59,8 +60,11 @@ type Options struct {
 	Probe func(host string, port int) error
 	// TestConn runs the form's "test connection" (default sshrun.TestConnection).
 	TestConn func(c config.Connection, secret string) error
-	// Home is where harness configs are looked up for the Setup tab (default $HOME).
+	// Home is where harness configs are looked up for the Setup tab and what ~ means in the key file field
+	// (default $HOME).
 	Home string
+	// SSHDir is where the form detects private keys (default $TUSSH_SSH_DIR, else Home/.ssh).
+	SSHDir string
 }
 
 type tickMsg time.Time
@@ -193,6 +197,12 @@ func New(opts Options) *Model {
 	}
 	if opts.Home == "" {
 		opts.Home, _ = os.UserHomeDir()
+	}
+	if opts.SSHDir == "" {
+		opts.SSHDir = os.Getenv("TUSSH_SSH_DIR")
+	}
+	if opts.SSHDir == "" && opts.Home != "" {
+		opts.SSHDir = filepath.Join(opts.Home, ".ssh")
 	}
 	si := textinput.New()
 	si.Prompt = "/"
