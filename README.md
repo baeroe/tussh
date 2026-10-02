@@ -196,7 +196,13 @@ There is deliberately no tool for interactive sessions or tunnels. A broken `con
 
 ## Install
 
-Requires Go 1.26+ and OpenSSH 8.4+.
+```sh
+brew install baeroe/tap/tussh
+```
+
+The formula in [baeroe/homebrew-tap](https://github.com/baeroe/homebrew-tap) builds from the tagged source. Requires OpenSSH 8.4+.
+
+From source (Go 1.26+):
 
 ```sh
 make install          # builds to ~/.local/bin/tussh
@@ -204,6 +210,14 @@ make install          # builds to ~/.local/bin/tussh
 ```
 
 `make build` builds `bin/tussh`, and `make test` runs all tests.
+
+### Releasing
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The `Release` workflow runs the tests and publishes a GitHub release with generated notes. The tap bumps its formula to the new release within an hour.
 
 ## Tests
 
