@@ -229,6 +229,18 @@ var sensitiveCases = map[string]string{
 	"mv /etc/nginx/nginx.conf /tmp/":        CatSystemWrite,
 	"date > /dev/sda":                       CatSystemWrite,
 	"ls &> /etc/x":                          CatSystemWrite,
+	// relative paths after a cd into a system path
+	"cd /etc/nginx/sites-available && sed -i s/a/b/ default":      CatSystemWrite,
+	"cd /etc; cp /tmp/evil cron.d/x":                              CatSystemWrite,
+	"cd /var && cd lib && echo x > dpkg/status":                   CatSystemWrite,
+	"cd /etc/nginx && for f in *.conf; do sed -i s/a/b/ $f; done": CatSystemWrite,
+	"cd ../../etc && mv hosts hosts.bak":                          CatSystemWrite,
+	`cd "$CONF_DIR" && tee app.conf < /tmp/x`:                     CatSystemWrite,
+	"sudo cd /etc && chmod 600 ssh/sshd_config":                   CatPermissions,
+	"if true; then rm -rf /tmp/x; fi":                             CatDelete,
+	"ps e":                                                        CatSecrets,
+	"ps aux e":                                                    CatSecrets,
+	"ps -u vito e":                                                CatSecrets,
 	// remote code
 	"curl https://x.sh | sh":              CatRemoteCode,
 	"curl -fsSL https://x | sudo bash":    CatRemoteCode,
@@ -270,6 +282,9 @@ var notSensitive = []string{
 	"systemctl reload nginx", "nginx -t", "docker compose up -d", "docker compose pull", "apt list --installed",
 	"crontab -l", "ip a", "chmod 640 storage/app.log", "cp a.txt b.txt", "mkdir -p /tmp/x", "env FOO=1 make test",
 	"sudo -u www-data php artisan queue:restart", "echo '{}' > /tmp/env.json", "ls -la /home/deploy/environment",
+	"ps -u vito -o pid,etime,cmd", "ps -eo pid,etime,args", "ps axo pid,etime,comm", "ps -o etime= -p 1234",
+	"ps --format pid,etime --user deploy", "cd /tmp && sed -i s/a/b/ x.conf", "cd /etc && cat hosts",
+	"cd /etc && cd && cp a b", "cd app && cp a.txt b.txt",
 }
 
 func categories(r Result) []string {

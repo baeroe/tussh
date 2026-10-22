@@ -1,4 +1,4 @@
-// Package notify tells the human about a new approval request when no tussh TUI is open:
+// Package notify tells the human about a new approval request or an agent-created connection:
 // a macOS notification (osascript). It fails silently.
 package notify
 

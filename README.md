@@ -39,14 +39,14 @@ The sensitive command rules apply at **every** level. A command that matches alw
 
 | Category | Examples |
 |---|---|
-| `secrets` | `.env*`, `*.pem`, `*.key`, `id_rsa`/`id_ed25519`, `/etc/shadow`, `credentials`, `.pgpass`, `.my.cnf`, `env.php`, `wp-config.php`, `env`/`printenv`, `ps e`, `/proc/*/environ`, `docker inspect`, `docker compose config`, `*_history` |
+| `secrets` | `.env*`, `*.pem`, `*.key`, `id_rsa`/`id_ed25519`, `/etc/shadow`, `credentials`, `.pgpass`, `.my.cnf`, `env.php`, `wp-config.php`, `env`/`printenv`, `ps e` (BSD option clusters only, not `-o etime`), `/proc/*/environ`, `docker inspect`, `docker compose config`, `*_history` |
 | `delete` | `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `find -delete`, `find -exec rm`, `git clean`, `git reset --hard`, `git push --force`, `rsync --delete`, `dd of=`, `mkfs`, `fdisk` |
 | `database` | `DROP …`, `TRUNCATE`, `DELETE FROM` (with or without `WHERE`), `UPDATE … SET` without `WHERE`, destructive statements in `mysql`/`psql`/`sqlite3`/`mongosh`/`redis-cli` invocations, `dropdb`, `artisan migrate:fresh`, `db:wipe`, `doctrine:schema:drop` |
 | `docker` | `docker rm`/`rmi`, `… prune`, `volume rm`, `compose down` (with or without `-v`), `compose rm`, `kubectl delete/apply/…`, `helm uninstall/upgrade` |
 | `system` | `systemctl stop/restart/disable/…`, `service X stop`, `reboot`, `shutdown`, `kill`/`pkill`/`killall`, `docker stop/kill/restart`, `crontab` (except `-l`), firewall changes, user and password changes |
 | `permissions` | `chmod -R`/`chown -R`, world-writable modes (`777`, `o+w`, …), any permission change on a system path |
 | `packages` | `apt remove/purge/autoremove`, `yum/dnf remove`, `apk del`, `pacman -R`, `pip uninstall`, `npm uninstall -g`, `brew uninstall`, `dpkg -r`, `rpm -e` |
-| `system-write` | redirects (`>`, `>>`, `&>`) into `/etc`, `/usr`, `/var/lib`, `/var/log`, `/dev/sd*`, … or `authorized_keys`, `tee` and `sed -i` on such paths, and `cp`/`mv`/`ln` into such paths |
+| `system-write` | redirects (`>`, `>>`, `&>`) into `/etc`, `/usr`, `/var/lib`, `/var/log`, `/dev/sd*`, … or `authorized_keys`, `tee` and `sed -i` on such paths, and `cp`/`mv`/`ln` into such paths. Relative paths count too after a `cd` into a system path (`cd /etc/nginx && sed -i … default`); after a `cd` tussh cannot follow (`cd "$DIR"`, `cd -`), every relative path counts |
 | `remote-code` | `curl … \| sh`, `wget … \| bash`, `bash <(curl …)`, `sh -c "$(curl …)"` |
 | `unsure` | `sh -c`, `eval`, `python -c`, `perl -e`, `base64 -d`, pipes into a shell, `$(…)`, backticks, `<(…)`, `$'…'`, here-docs into a shell, `su`, `sudo -i`, a variable used as the command, unparseable quoting, and an invalid rules file |
 
@@ -83,13 +83,13 @@ If the file is invalid (broken JSON, an unknown field or a bad regex), **every**
 ## Approval flow
 
 1. An agent calls `run_command`. tussh classifies the command and applies the access level.
-2. If the command needs approval, tussh writes a request to `~/.local/state/tussh/approvals/` (files with mode 0600 and atomic writes), and the MCP call **blocks**.
+2. If the command needs approval, tussh writes a request to `~/.local/state/tussh/approvals/` (files with mode 0600 and atomic writes), and the MCP call waits for the decision for up to **40 s**. Without a decision by then it returns `decision: "pending"` with a `request_id`, so it ends before MCP clients give up (Claude Code aborts after 60 s). The agent then calls `wait_approval(request_id)`, again for up to 40 s each. The command runs **only inside a call that receives the approval**: if you approve after the agent has given up, nothing runs, and if the agent cancels the call, the request is denied. A decided request whose agent never comes back is dropped after 10 minutes and logged as not run.
 3. The TUI's **Alerts** tab shows each pending request as a card: the connection and its access level, the requesting agent (MCP `clientInfo`), the command, why it needs approval, the agent's optional justification, and a countdown bar until it is denied automatically. When a new request arrives while the TUI is open, the same card pops up over the current view. Keys: **y** approve, **m** approve & remember (see below), **n** deny (you can type a note for the agent, **Enter** sends it, **Esc** cancels), **Esc** later.
 
    ![The Alerts tab: two pending requests, the selected one as a card with the reasons, the agent's justification and the countdown](docs/screenshots/alerts.png)
 
    *Alerts: pending agent requests with the reasons, the agent's justification and the auto-deny countdown.*
-4. If no TUI is open, tussh sends a macOS notification (`osascript`). It fails silently.
+4. tussh sends a macOS notification (`osascript`) for every request, also while a TUI runs (it may sit in a hidden pane). It fails silently; `disable_notifications` switches it off.
 5. Without a decision within **120 s**, the request is denied automatically, and the agent gets a clear message. You can change the timeout with `approval_timeout_seconds` in `~/.config/tussh/settings.json` or the `TUSSH_APPROVAL_TIMEOUT` environment variable.
 
 A deny note is passed to the agent with the denial (`denied by the user: <note>`) and stored in the audit log.
@@ -178,7 +178,8 @@ MCP tools:
 | Tool | Does |
 |---|---|
 | `list_connections` | Returns the name, description, tags and access level of every connection that is not `none`. It returns no hosts, users or secrets. |
-| `run_command(connection, command, justification?, timeout?)` | Classifies the command, then runs it, waits for approval, or refuses it. It runs `ssh -T` with `ConnectTimeout=10`, `ClearAllForwardings=yes`, `ControlPath=none` and `ForwardAgent=no`, and with stdin closed. The remote timeout defaults to 30 s (max 600 s), and on timeout the whole process group is killed. stdout and stderr are capped at 20 kB each (head and tail are kept). Returns `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated` and `decision`. A command you remembered with **m** on this connection runs without asking again until the entry expires. |
+| `run_command(connection, command, justification?, timeout?)` | Classifies the command, then runs it, waits for approval, or refuses it. It runs `ssh -T` with `ConnectTimeout=10`, `ClearAllForwardings=yes`, `ControlPath=none` and `ForwardAgent=no`, and with stdin closed. The remote timeout defaults to 30 s (max 600 s), and on timeout the whole process group is killed. stdout and stderr are capped at 20 kB each (head and tail are kept). Returns `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated` and `decision`. A command you remembered with **m** on this connection runs without asking again until the entry expires. Returns `decision: "pending"` and a `request_id` instead if the approval takes longer than 40 s. |
+| `wait_approval(request_id)` | Keeps waiting for a pending `run_command` (up to 40 s per call). Returns the command's result once you approve it (the command runs only now), an error if it was denied or timed out, or `pending` again. |
 
 | `new_connection(name, host, port?, user?, description?, tags?, tunnels?)` | Adds a connection to your list. Agents can set **only** these fields; `tunnels` is a list of `name=[bind:]local:host:port`, validated like the form. The schema has no access level, auth method, key file, password or passphrase, and any other field is rejected (`additionalProperties: false`; tussh also rejects such fields itself and never logs their values). The connection is created with access level `none`, no credentials, `created_by: "agent"` (plus the harness name and version from `clientInfo` and the time) and `needs_setup: true`, so it does not show up in `list_connections` and `run_command` cannot use it. The result tells the agent that it is not usable until you set the authentication and an access level. Names must be unique (case-insensitive); the error for a duplicate also reveals that a hidden connection with that name exists. At most 20 agent-created connections can wait for setup at once. |
 

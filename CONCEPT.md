@@ -10,7 +10,7 @@ tussh succeeds the herdr-ssh prototype (a Python herdr plugin). It keeps that pl
 | Connections | `~/.config/tussh/connections.json` + keychain | the same, filtered by access level |
 | Sessions | interactive `ssh` via `tea.ExecProcess` | `run_command` only (non-interactive) |
 | Tunnels | Tunnels tab | none |
-| Approvals | Alerts tab and popup, `tussh approve/deny` | blocking `run_command` |
+| Approvals | Alerts tab and popup, `tussh approve/deny` | `run_command`, then `wait_approval` while pending |
 
 The TUI and any number of MCP processes share state only through files in the state dir: `approvals/`, `allow/` (remembered commands), `audit.jsonl`, `tunnels/`, `askpass/`, `used/` (last use per connection) and `tui/` (heartbeats that tell an MCP process whether a TUI is open). `connections.json` is written by the TUI and by the MCP tool `new_connection`, always as a locked read-modify-write (`flock` on `connections.json.lock` + atomic rename); the TUI reloads it when it changes.
 
@@ -34,7 +34,6 @@ The TUI and any number of MCP processes share state only through files in the st
 
 - Agents starting tunnels, or an interactive session for agents (`open_pane`)
 - Agents editing or deleting connections (they can only add new ones with `new_connection`)
-- `request_status` / asynchronous approvals. Today `run_command` blocks until it is decided or times out, so a harness with a shorter tool timeout than the approval timeout gives up first.
 - Approving an edited command, and remembering command patterns or prefixes (remembering is exact-match only)
 - Switching off built-in rules, per-connection rule sets, and safe-pipe allowlisting for read-only (`| grep`, `| head`)
 - Jump hosts and ProxyJump per connection (tussh can use the ssh config through `TUSSH_SSH_CONFIG`, but the form has no field for it)
