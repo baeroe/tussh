@@ -27,7 +27,12 @@ const instructions = "SSH access to the user's servers through tussh. Call list_
 	"commands run immediately, anything else waits for the user's approval), approve-each (every command waits for " +
 	"approval), trusted (commands run immediately). Sensitive commands (reading secrets, deleting, destructive " +
 	"database/docker/service operations, permission changes, package removal, curl|sh, ...) always wait for approval. " +
-	"Pass a short justification so the user can decide quickly. A denied or timed-out request must not be retried " +
+	"Pass a short justification so the user can decide quickly. If run_command returns decision \"pending\", the " +
+	"command has not run yet: call wait_approval with its request_id (repeatedly while it stays pending) instead of " +
+	"sending the command again. Keep each command short (well under 45 s); start long jobs with " +
+	"nohup ... >log 2>&1 </dev/null & and check the log with further short commands. After a failed or timed-out " +
+	"call, check read-only whether the command took effect before repeating it. Split commands that need approval " +
+	"from the rest. A denied or timed-out request must not be retried " +
 	"unchanged and must never be worked around; ask the user instead. new_connection adds a connection to the " +
 	"user's list (name, host, port, user, description, tags, tunnels only). It starts with access level none and " +
 	"no credentials, so it is not usable and not listed until the user sets the authentication and an access " +
@@ -193,13 +198,22 @@ func tools() []map[string]any {
 			"name": "run_command",
 			"description": "Run one non-interactive shell command on a connection over ssh (no TTY, stdin closed). " +
 				"Depending on the access level and the command it runs immediately or waits until the user approves or denies it in tussh " +
-				"(auto-denied after the approval timeout, default 120 s). Returns exit_code, stdout, stderr (long output is truncated in the middle), timed_out.",
+				"(auto-denied after the approval timeout, default 120 s). Returns exit_code, stdout, stderr (long output is truncated in the middle), timed_out. " +
+				"If no decision arrives within about 40 s it returns decision \"pending\" with a request_id: the command has NOT run; call wait_approval with that request_id.",
 			"inputSchema": schema(map[string]any{
 				"connection":    map[string]any{"type": "string", "description": "Connection name from list_connections."},
 				"command":       map[string]any{"type": "string", "description": fmt.Sprintf("Command line for the remote shell (max %d characters).", classify.MaxCommandLen)},
 				"justification": map[string]any{"type": "string", "description": "Why you need this command; shown to the user when approval is needed."},
 				"timeout":       map[string]any{"type": "integer", "minimum": 1, "maximum": int(sshrun.MaxTimeout.Seconds()), "description": fmt.Sprintf("Seconds before the remote command is killed (default %d). Approval waiting time does not count.", int(sshrun.DefaultTimeout.Seconds()))},
 			}, "connection", "command"),
+		},
+		{
+			"name": "wait_approval",
+			"description": "Keep waiting for a command run_command returned as pending. Returns the command's result once the user approves it " +
+				"(the command runs only now), an error if it was denied or timed out, or decision \"pending\" again after about 40 s: then call it again.",
+			"inputSchema": schema(map[string]any{
+				"request_id": map[string]any{"type": "string", "description": "request_id from the pending run_command result."},
+			}, "request_id"),
 		},
 		{
 			"name": "new_connection",
@@ -275,6 +289,29 @@ func (s *Server) callTool(ctx context.Context, m rpcMsg) {
 		if err != nil {
 			if !agent.IsToolError(err) {
 				s.logger.Printf("run_command: %v", err)
+			}
+			s.reply(m.ID, textResult(err.Error(), true))
+			return
+		}
+		s.reply(m.ID, textResult(res, false))
+	case "wait_approval":
+		var a struct {
+			RequestID string `json:"request_id"`
+		}
+		if len(p.Arguments) > 0 {
+			if err := json.Unmarshal(p.Arguments, &a); err != nil {
+				s.reply(m.ID, textResult("invalid arguments: "+err.Error(), true))
+				return
+			}
+		}
+		if a.RequestID == "" {
+			s.reply(m.ID, textResult("request_id is required", true))
+			return
+		}
+		res, err := s.svc.WaitApproval(ctx, a.RequestID)
+		if err != nil {
+			if !agent.IsToolError(err) {
+				s.logger.Printf("wait_approval: %v", err)
 			}
 			s.reply(m.ID, textResult(err.Error(), true))
 			return

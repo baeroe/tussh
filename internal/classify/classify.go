@@ -205,11 +205,13 @@ func (c *Classifier) Classify(command string) Result {
 		}
 	}
 
+	cwd := ""
 	for _, seg := range segments(command) {
-		for _, f := range redirectFindings(seg) {
+		for _, f := range redirectFindings(seg, cwd) {
 			add(f)
 		}
-		top, ok := toSimple(seg.words, seg)
+		top, ok := toSimple(seg.words, seg, cwd)
+		cwd = nextCwd(cwd, seg.words)
 		if !ok {
 			continue
 		}
@@ -217,7 +219,7 @@ func (c *Classifier) Classify(command string) Result {
 		if isExecutor(top) {
 			// every trailing position may be the start of the executed command
 			for i := range top.args {
-				if s, ok := toSimple(top.args[i:], seg); ok {
+				if s, ok := toSimple(top.args[i:], seg, cwd); ok {
 					cands = append(cands, s)
 				}
 			}

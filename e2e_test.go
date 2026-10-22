@@ -261,7 +261,7 @@ func TestMCPHandshakeAndList(t *testing.T) {
 	for _, tool := range r["result"].(map[string]any)["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if strings.Join(names, ",") != "list_connections,run_command,new_connection" {
+	if strings.Join(names, ",") != "list_connections,run_command,wait_approval,new_connection" {
 		t.Fatalf("tools: %v", names)
 	}
 	isErr, text, sc := c.call("list_connections", map[string]any{})

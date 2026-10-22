@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baeroe/tussh/internal/allow"
@@ -28,16 +29,25 @@ type Service struct {
 	Agent string
 	Queue *approval.Queue
 	Poll  time.Duration
-	// Notify is called for a new approval request when no TUI is open (defaults to notify.NewRequest).
+	// WaitSlice is how long one run_command/wait_approval call waits for a decision before it returns
+	// "pending" (0: until decided). It must stay below the MCP client's request timeout.
+	WaitSlice time.Duration
+	// Notify is called for a new approval request (defaults to notify.NewRequest).
 	Notify func(req approval.Request)
 	// NotifyNewConn is called for a connection created with new_connection when no TUI is open
 	// (defaults to notify.NewConnection).
 	NotifyNewConn func(agent, connection string)
+
+	mu      sync.Mutex
+	pending map[string]*pendingRun
 }
+
+// DefaultWaitSlice keeps a call well below the 60 s after which MCP clients (or 1MCP in between) give up.
+const DefaultWaitSlice = 40 * time.Second
 
 // New returns a service using the default state locations.
 func New(agentName string) *Service {
-	return &Service{Agent: agentName, Queue: approval.Open(), Poll: 250 * time.Millisecond}
+	return &Service{Agent: agentName, Queue: approval.Open(), Poll: 250 * time.Millisecond, WaitSlice: DefaultWaitSlice}
 }
 
 // ToolError is an error reported to the agent as a tool error (isError), not a protocol error.
@@ -91,7 +101,9 @@ type RunRequest struct {
 // RunResponse is the run_command output.
 type RunResponse struct {
 	Connection string `json:"connection"`
-	Decision   string `json:"decision"` // auto | approved
+	Decision   string `json:"decision"`             // auto | approved | pending
+	RequestID  string `json:"request_id,omitempty"` // pending: pass it to wait_approval
+	Message    string `json:"message,omitempty"`
 	ExitCode   *int   `json:"exit_code"`
 	Stdout     string `json:"stdout"`
 	Stderr     string `json:"stderr"`
@@ -154,41 +166,24 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 			return block(toolErr("cannot queue approval request: %v", err))
 		}
 		entry.RequestID = r.ID
-		if !approval.TUIOpen() {
-			if s.Notify != nil {
-				s.Notify(*r)
-			} else {
-				notify.NewRequest(notify.Options{Notification: !settings.DisableNotifications}, conn.Name, req.Command)
-			}
+		// always notify: a fresh TUI heartbeat says nothing about whether the TUI is visible
+		if s.Notify != nil {
+			s.Notify(*r)
+		} else {
+			notify.NewRequest(notify.Options{Notification: !settings.DisableNotifications}, conn.Name, req.Command)
 		}
-		d, err := s.Queue.Wait(r.ID, timeout, s.Poll, ctx.Done())
-		if err != nil {
-			return block(toolErr("approval failed: %v", err))
-		}
-		entry.DecidedBy = d.By
-		switch d.Decision {
-		case approval.Approved:
-			entry.Decision = audit.Approved
-		case approval.Timeout:
-			entry.Decision = audit.Timeout
-			_ = audit.Append(entry)
-			return nil, toolErr("not approved: nobody approved the command within %s, so it was denied automatically. Reasons it needed approval: %s. Ask the user to open tussh (Alerts tab) and try again, or change your approach.", timeout, strings.Join(dec.Reasons, "; "))
-		default:
-			entry.Decision, entry.Note = audit.Denied, d.Note
-			_ = audit.Append(entry)
-			msg := "denied by the user"
-			if d.Note != "" {
-				msg += ": " + d.Note
-			}
-			return nil, toolErr("%s. Do not retry the same command; ask the user how to proceed.", msg)
-		}
+		return s.await(ctx, s.track(r.ID, timeout, conn, dec.Command, req.TimeoutSec, entry))
 	default:
 		entry.Decision = audit.Auto
 	}
+	return s.execute(ctx, conn, dec.Command, req.TimeoutSec, entry)
+}
 
+// execute runs an allowed command over ssh and audits it.
+func (s *Service) execute(ctx context.Context, conn config.Connection, command string, timeoutSec int, entry audit.Entry) (*RunResponse, error) {
 	config.TouchUsed(conn.ID)
 	start := time.Now()
-	out, err := sshrun.Run(ctx, conn, dec.Command, sshrun.ClampTimeout(req.TimeoutSec))
+	out, err := sshrun.Run(ctx, conn, command, sshrun.ClampTimeout(timeoutSec))
 	entry.DurationMS = time.Since(start).Milliseconds()
 	if err != nil {
 		entry.Error = err.Error()
@@ -210,6 +205,164 @@ func (s *Service) RunCommand(ctx context.Context, req RunRequest) (*RunResponse,
 	}
 	return &RunResponse{Connection: conn.Name, Decision: decision, ExitCode: out.ExitCode, Stdout: out.Stdout,
 		Stderr: out.Stderr, TimedOut: out.TimedOut, Truncated: out.Truncated}, nil
+}
+
+// --- pending approvals ----------------------------------------------------------------------
+
+// pendingRun is a command waiting for the user's decision. The wait for the decision runs in the background,
+// so a call can return "pending" before the client gives up. The command only runs inside a run_command or
+// wait_approval call that receives the approval, never for an agent that is no longer waiting.
+type pendingRun struct {
+	id         string
+	conn       config.Connection
+	command    string
+	timeoutSec int
+	entry      audit.Entry
+	timeout    time.Duration // approval timeout
+
+	done    chan struct{} // closed once decision/err/decided are set
+	d       *approval.Decision
+	err     error
+	decided time.Time
+
+	cancel     chan struct{}
+	cancelOnce sync.Once
+	waiting    bool // a call is waiting for it (guarded by Service.mu)
+}
+
+// abandonAfter is how long a decided request is kept for an agent that has not come back for it.
+const abandonAfter = 10 * time.Minute
+
+func (s *Service) track(id string, timeout time.Duration, conn config.Connection, command string, timeoutSec int, entry audit.Entry) *pendingRun {
+	p := &pendingRun{id: id, conn: conn, command: command, timeoutSec: timeoutSec, entry: entry, timeout: timeout,
+		done: make(chan struct{}), cancel: make(chan struct{}), waiting: true}
+	s.mu.Lock()
+	if s.pending == nil {
+		s.pending = map[string]*pendingRun{}
+	}
+	s.sweepLocked()
+	s.pending[id] = p
+	s.mu.Unlock()
+	go func() {
+		p.d, p.err = s.Queue.Wait(id, timeout, s.Poll, p.cancel)
+		p.decided = time.Now()
+		close(p.done)
+	}()
+	return p
+}
+
+// WaitApproval keeps waiting for a request run_command returned as pending, and runs the command once it is
+// approved.
+func (s *Service) WaitApproval(ctx context.Context, id string) (*RunResponse, error) {
+	s.mu.Lock()
+	s.sweepLocked()
+	p, ok := s.pending[id]
+	busy := ok && p.waiting
+	if ok && !busy {
+		p.waiting = true
+	}
+	s.mu.Unlock()
+	if !ok {
+		return nil, toolErr("unknown request_id %q: it was never pending, its result was already returned, or it expired. Check the command's effect before running it again.", id)
+	}
+	if busy {
+		return nil, toolErr("another call is already waiting for request %s", id)
+	}
+	return s.await(ctx, p)
+}
+
+// await waits up to WaitSlice for the decision of p. On approval it runs the command.
+func (s *Service) await(ctx context.Context, p *pendingRun) (*RunResponse, error) {
+	var slice <-chan time.Time
+	if s.WaitSlice > 0 {
+		t := time.NewTimer(s.WaitSlice)
+		defer t.Stop()
+		slice = t.C
+	}
+	select {
+	case <-p.done:
+	case <-ctx.Done():
+		// the agent gave up: deny instead of letting a late approval run the command unseen
+		p.cancelOnce.Do(func() { close(p.cancel) })
+		<-p.done
+	case <-slice:
+		s.mu.Lock()
+		p.waiting = false
+		s.mu.Unlock()
+		return &RunResponse{Connection: p.conn.Name, Decision: "pending", RequestID: p.id,
+			Message: fmt.Sprintf("Waiting for the user's approval in tussh (auto-denied %s after the request). The command has NOT run. "+
+				"Call wait_approval with this request_id to keep waiting; the command runs only when a wait_approval call receives the approval. "+
+				"Do not send the command again with run_command.", p.timeout)}, nil
+	}
+	s.mu.Lock()
+	delete(s.pending, p.id)
+	s.mu.Unlock()
+	return s.finish(ctx, p)
+}
+
+// finish turns the decision of p into the tool result, running the command if it was approved.
+func (s *Service) finish(ctx context.Context, p *pendingRun) (*RunResponse, error) {
+	entry := p.entry
+	if p.err != nil {
+		entry.Decision, entry.Error = audit.Blocked, p.err.Error()
+		_ = audit.Append(entry)
+		return nil, toolErr("approval failed: %v", p.err)
+	}
+	d := p.d
+	entry.DecidedBy = d.By
+	switch d.Decision {
+	case approval.Approved:
+		entry.Decision = audit.Approved
+		if ctx.Err() != nil {
+			entry.Error = "approved after the agent cancelled the request; not run"
+			_ = audit.Append(entry)
+			return nil, toolErr("cancelled before the command ran")
+		}
+		return s.execute(ctx, p.conn, p.command, p.timeoutSec, entry)
+	case approval.Timeout:
+		entry.Decision = audit.Timeout
+		_ = audit.Append(entry)
+		return nil, toolErr("not approved: nobody approved the command within %s, so it was denied automatically. Reasons it needed approval: %s. Ask the user to open tussh (Alerts tab) and try again, or change your approach.", p.timeout, strings.Join(entry.Reasons, "; "))
+	default:
+		entry.Decision, entry.Note = audit.Denied, d.Note
+		_ = audit.Append(entry)
+		msg := "denied by the user"
+		if d.Note != "" {
+			msg += ": " + d.Note
+		}
+		return nil, toolErr("%s. Do not retry the same command; ask the user how to proceed.", msg)
+	}
+}
+
+// sweepLocked drops decided requests whose agent never came back for the result and audits them as not run.
+func (s *Service) sweepLocked() {
+	for id, p := range s.pending {
+		if p.waiting {
+			continue
+		}
+		select {
+		case <-p.done:
+		default:
+			continue
+		}
+		if time.Since(p.decided) < abandonAfter {
+			continue
+		}
+		delete(s.pending, id)
+		e := p.entry
+		switch {
+		case p.err != nil:
+			e.Decision = audit.Blocked
+		case p.d.Decision == approval.Approved:
+			e.Decision, e.DecidedBy = audit.Approved, p.d.By
+		case p.d.Decision == approval.Timeout:
+			e.Decision, e.DecidedBy = audit.Timeout, p.d.By
+		default:
+			e.Decision, e.DecidedBy, e.Note = audit.Denied, p.d.By, p.d.Note
+		}
+		e.Error = "the agent never asked for the result, so the command was not run"
+		_ = audit.Append(e)
+	}
 }
 
 // storedSecrets returns a function that removes the connection's own keychain secret from text before it

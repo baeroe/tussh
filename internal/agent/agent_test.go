@@ -144,3 +144,91 @@ func TestAuditOutputCanBeDisabled(t *testing.T) {
 		t.Fatalf("output logged: %+v", entries[0])
 	}
 }
+
+func TestPendingApprovalRunsOnlyInWaitApproval(t *testing.T) {
+	svc, _ := setup(t)
+	svc.WaitSlice = 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := svc.RunCommand(ctx, RunRequest{Connection: "web", Command: "systemctl restart nginx"})
+	if err != nil || res.Decision != "pending" || res.RequestID == "" || res.ExitCode != nil {
+		t.Fatalf("want pending: %+v %v", res, err)
+	}
+	// approved while no call is waiting: nothing runs until the agent comes back
+	if err := svc.Queue.Resolve(res.RequestID, approval.Approved, "test", ""); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if entries, _ := audit.Read(10); len(entries) != 0 {
+		t.Fatalf("command ran without a waiting agent: %+v", entries)
+	}
+	out, err := svc.WaitApproval(ctx, res.RequestID)
+	if err != nil || out.Decision != "approved" || out.Stdout != "REMOTE systemctl restart nginx\n" {
+		t.Fatalf("wait_approval: %+v %v", out, err)
+	}
+	if _, err := svc.WaitApproval(ctx, res.RequestID); err == nil || !strings.Contains(err.Error(), "unknown request_id") {
+		t.Fatalf("a result must be returned only once: %v", err)
+	}
+}
+
+func TestPendingApprovalStaysPendingAndDenies(t *testing.T) {
+	svc, _ := setup(t)
+	svc.WaitSlice = 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, _ := svc.RunCommand(ctx, RunRequest{Connection: "web", Command: "uptime"})
+	again, err := svc.WaitApproval(ctx, res.RequestID)
+	if err != nil || again.Decision != "pending" || again.RequestID != res.RequestID {
+		t.Fatalf("still pending: %+v %v", again, err)
+	}
+	svc.Queue.Resolve(res.RequestID, approval.Denied, "test", "not now")
+	if _, err := svc.WaitApproval(ctx, res.RequestID); err == nil || !strings.Contains(err.Error(), "not now") {
+		t.Fatalf("deny must reach the agent: %v", err)
+	}
+	entries, _ := audit.Read(1)
+	if entries[0].Decision != audit.Denied || entries[0].ExitCode != nil {
+		t.Fatalf("audit: %+v", entries[0])
+	}
+}
+
+func TestCancelledWaitDeniesRequest(t *testing.T) {
+	svc, _ := setup(t)
+	svc.WaitSlice = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for len(svc.Queue.Pending()) == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+	if _, err := svc.RunCommand(ctx, RunRequest{Connection: "web", Command: "uptime"}); err == nil {
+		t.Fatal("a cancelled request must not run")
+	}
+	entries, _ := audit.Read(1)
+	if entries[0].Decision != audit.Denied || entries[0].DecidedBy != "cancelled" {
+		t.Fatalf("audit: %+v", entries[0])
+	}
+}
+
+func TestAbandonedApprovalIsAuditedAsNotRun(t *testing.T) {
+	svc, _ := setup(t)
+	svc.WaitSlice = 20 * time.Millisecond
+	ctx := context.Background()
+	res, _ := svc.RunCommand(ctx, RunRequest{Connection: "web", Command: "uptime"})
+	svc.Queue.Resolve(res.RequestID, approval.Approved, "test", "")
+	svc.mu.Lock()
+	p := svc.pending[res.RequestID]
+	svc.mu.Unlock()
+	<-p.done
+	p.decided = time.Now().Add(-abandonAfter - time.Second)
+	if _, err := svc.WaitApproval(ctx, "0000"); err == nil {
+		t.Fatal("unknown id")
+	}
+	entries, _ := audit.Read(1)
+	if len(entries) != 1 || entries[0].Decision != audit.Approved || entries[0].ExitCode != nil || !strings.Contains(entries[0].Error, "not run") {
+		t.Fatalf("audit: %+v", entries)
+	}
+	if _, err := svc.WaitApproval(ctx, res.RequestID); err == nil {
+		t.Fatal("an abandoned request must not run later")
+	}
+}

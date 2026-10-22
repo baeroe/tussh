@@ -33,6 +33,7 @@ type simple struct {
 	name string   // basename of the command word
 	args []string // remaining words
 	seg  segment
+	cwd  string // working directory followed from earlier cd segments ("" = login directory)
 }
 
 // cmdRule matches simple commands.
@@ -89,6 +90,15 @@ var wrappers = map[string]struct {
 	"runuser":  {[]string{"-u", "-g", "-G", "--user", "--group"}, 0},
 	"chrt":     {nil, 1},
 	"taskset":  {nil, 1},
+	// shell keywords in front of a command (segments split at ; and newlines, not at keywords)
+	"do":    {nil, 0},
+	"then":  {nil, 0},
+	"else":  {nil, 0},
+	"elif":  {nil, 0},
+	"if":    {nil, 0},
+	"while": {nil, 0},
+	"until": {nil, 0},
+	"!":     {nil, 0},
 }
 
 var assignRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
@@ -133,12 +143,12 @@ func unwrap(words []string) []string {
 	return words
 }
 
-func toSimple(words []string, seg segment) (simple, bool) {
+func toSimple(words []string, seg segment, cwd string) (simple, bool) {
 	words = unwrap(words)
 	if len(words) == 0 {
 		return simple{}, false
 	}
-	return simple{name: path.Base(words[0]), args: words[1:], seg: seg}, true
+	return simple{name: path.Base(words[0]), args: words[1:], seg: seg, cwd: cwd}, true
 }
 
 // executors run a further command given as trailing words (docker exec CTR CMD...). Their trailing words are
@@ -243,7 +253,66 @@ func isSystemPath(p string) bool {
 	return systemPathRE.MatchString(p)
 }
 
+// cwdUnknown marks a working directory the classifier cannot follow (cd "$DIR", cd -, cd ../..).
+const cwdUnknown = "?"
+
+// nextCwd follows cd/pushd, so relative paths after "cd /etc/nginx" are checked as system paths too.
+// "" is the login directory, which tussh treats like any non-system directory.
+func nextCwd(cwd string, words []string) string {
+	words = unwrap(words)
+	if len(words) == 0 || !in(path.Base(words[0]), "cd", "pushd", "chdir") {
+		return cwd
+	}
+	if in("-", words[1:]...) {
+		return cwdUnknown
+	}
+	p := positionals(words[1:])
+	if len(p) == 0 {
+		return ""
+	}
+	d := strings.Trim(p[0], `"'`)
+	switch {
+	case d == "~" || strings.HasPrefix(d, "~/") && !strings.Contains(d, ".."):
+		return ""
+	case strings.ContainsAny(d, "$`~*?["):
+		return cwdUnknown
+	case path.IsAbs(d):
+		return path.Clean(d)
+	case cwd == "":
+		if strings.Contains(d, "..") {
+			return cwdUnknown // may climb out of the login directory into a system path
+		}
+		return ""
+	case cwd == cwdUnknown:
+		return cwdUnknown
+	}
+	return path.Join(cwd, d)
+}
+
+// isSystemPathIn is isSystemPath for a path argument, with relative paths resolved against a followed cd.
+// After a cd the classifier cannot follow, every relative path counts as a system path.
+func isSystemPathIn(cwd, p string) bool {
+	if isSystemPath(p) {
+		return true
+	}
+	p = strings.Trim(p, `"'`)
+	if cwd == "" || p == "" || path.IsAbs(p) || strings.HasPrefix(p, "~") {
+		return false
+	}
+	if cwd == cwdUnknown {
+		return true
+	}
+	return isSystemPath(path.Join(cwd, p))
+}
+
+func (c simple) isSystemPath(p string) bool { return isSystemPathIn(c.cwd, p) }
+
 // --- built-in rules ------------------------------------------------------------------
+
+var (
+	psValueOpts  = []string{"-o", "-O", "-u", "-U", "-g", "-G", "-p", "-q", "-t", "-C", "-s", "-k", "-N", "--format", "--pid", "--ppid", "--user", "--User", "--group", "--Group", "--sort", "--tty", "--sid", "--quick-pid", "--cols", "--columns", "--rows", "--lines", "--width"}
+	bsdClusterRE = regexp.MustCompile(`^[A-Za-z]+$`)
+)
 
 var dbClients = []string{"mysql", "mariadb", "psql", "sqlite3", "sqlite", "mongo", "mongosh", "redis-cli", "clickhouse-client", "cqlsh", "sqlcmd", "usql"}
 
@@ -268,9 +337,28 @@ var builtinCmdRules = []cmdRule{
 		if c.name != "ps" {
 			return false
 		}
+		value := false // the word is the value of the previous option (-o pid,etime / -u user / BSD o)
 		for _, a := range c.args {
-			if !strings.HasPrefix(a, "-") && strings.Contains(a, "e") {
-				return true
+			if value {
+				value = false
+				continue
+			}
+			if strings.HasPrefix(a, "-") {
+				value = in(a, psValueOpts...)
+				continue
+			}
+			// a BSD option cluster (aux, auxe, e): letters only; a value letter takes the rest or the next word
+			if !bsdClusterRE.MatchString(a) {
+				continue
+			}
+			for i, l := range a {
+				if l == 'e' {
+					return true
+				}
+				if strings.ContainsRune("oOpqtUk", l) {
+					value = i == len(a)-1
+					break
+				}
 			}
 		}
 		return false
@@ -492,7 +580,7 @@ var builtinCmdRules = []cmdRule{
 			return false
 		}
 		for _, a := range positionals(c.args) {
-			if isSystemPath(a) {
+			if c.isSystemPath(a) {
 				return true
 			}
 		}
@@ -536,33 +624,33 @@ var builtinCmdRules = []cmdRule{
 		switch c.name {
 		case "tee":
 			for _, a := range positionals(c.args) {
-				if isSystemPath(a) {
+				if c.isSystemPath(a) {
 					return true
 				}
 			}
 		case "sed", "perl":
 			if hasArg(c.args, "-i", "--in-place") || hasShort(c.args, "i") {
 				for _, a := range positionals(c.args) {
-					if isSystemPath(a) {
+					if c.isSystemPath(a) {
 						return true
 					}
 				}
 			}
 		case "cp", "mv", "install", "ln", "rsync", "scp":
 			p := positionals(c.args)
-			if len(p) > 0 && isSystemPath(p[len(p)-1]) {
+			if len(p) > 0 && c.isSystemPath(p[len(p)-1]) {
 				return true
 			}
 			if c.name == "mv" {
 				for _, a := range p {
-					if isSystemPath(a) {
+					if c.isSystemPath(a) {
 						return true // moving away from a system path
 					}
 				}
 			}
 		case "dd":
 			for _, a := range c.args {
-				if strings.HasPrefix(a, "of=") && isSystemPath(a[3:]) {
+				if strings.HasPrefix(a, "of=") && c.isSystemPath(a[3:]) {
 					return true
 				}
 			}
@@ -628,9 +716,9 @@ var builtinReRules = []reRule{
 }
 
 // redirectRule flags > / >> into system paths.
-func redirectFindings(seg segment) []Finding {
+func redirectFindings(seg segment, cwd string) []Finding {
 	for _, t := range seg.redirects {
-		if isSystemPath(t) {
+		if isSystemPathIn(cwd, t) {
 			return []Finding{{"redirect-system", CatSystemWrite, "redirects output into a system path or authorized_keys (" + t + ")"}}
 		}
 	}
